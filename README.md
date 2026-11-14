@@ -19,6 +19,7 @@ python mcl.py --list-ports
 python mcl.py --port COM5          # real robot (autopilot starts OFF, press N to arm)
 python mcl.py --sim                # simulated robot (autopilot starts ON)
 python mcl.py --port COM5 --target2 70,30   # preset target 2's centre (inches)
+python serial_tester.py --port COM5         # bench-test the serial link, no maze needed
 ```
 
 The first run builds `sensor_table.npz`, a precomputed table of expected sensor
@@ -39,6 +40,7 @@ is the estimate, and orange lines are the live sensor readings drawn from it.
 | `navigator.py` | The mission: path planning, path following, modes, delivering the block |
 | `block_task.py` | Finding the block with the ToF, backing onto it, gripping it |
 | `mcl.py` | Display and main loop |
+| `serial_tester.py` | Bench tester for the `R` / `C` / `G` / `L` serial lines (no maze needed) |
 | `original_sim/` | The original keyboard-only simulation, kept for reference |
 
 ## Serial protocol (robot → PC)
@@ -231,6 +233,26 @@ Every command is either a pure drive `C,v,0` or a pure turn on the spot
 - **Safeguard:** as a final check, any command with both a speed and a turn
   rate has its speed set to 0.
 
+### Fixed-speed mode (`FIXED_SPEED_MODE`, off by default)
+Normally the autopilot asks for a range of speeds. For example, turns slow
+down as the robot nears the heading it wants, and it backs onto the block at
+2 then 1 in/s. With `FIXED_SPEED_MODE = True` every command uses one of two
+fixed magnitudes instead (the direction is kept):
+
+| Level | Speed | Turn rate | Used for |
+|---|---|---|---|
+| normal | `FIXED_SPEED_IN_S` = 4 in/s | `FIXED_TURN_DEG_S` = 60°/s | Driving along paths, wandering, sweeps, big turns |
+| precise | `FIXED_PRECISE_SPEED_IN_S` = 1.5 in/s | `FIXED_PRECISE_TURN_DEG_S` = 20°/s | The last ~14° of lining up a heading, the close-up block sweep, backing onto the block |
+
+A request at or below `FIXED_PRECISE_BELOW_SPEED_IN_S` (2.5 in/s), or below
+`FIXED_PRECISE_BELOW_TURN_DEG_S` (35°/s), gets the precise level; everything
+else gets the normal level.
+
+This keeps the firmware's speed control simple (two setpoints) and makes
+odometry more repeatable. In simulation (15 full missions) all blocks were
+delivered with no pickup retries. The median mission took 74 s, against 65 s
+with variable speeds.
+
 Set `ROBOT_CAN_ARC = True` if the robot can drive curves, and it will steer
 while moving instead. The simulated robot obeys the same limitation, so
 `--sim` shows how the real robot will behave.
@@ -281,6 +303,46 @@ quitting does **not** open the gripper, so a held block stays held.
 7. Keep streaming `R,` lines the whole time, including the ToF field.
 
 The simulated robot follows these same rules.
+
+## Bench-testing the firmware (`serial_tester.py`)
+Check the serial link before going into the maze. Put the robot on blocks, or
+on the floor with about 2 ft of clear space, and keep a hand near Space / Esc.
+
+```
+python serial_tester.py --port COM5
+python serial_tester.py --port COM5 --speed 4 --turn 45 --log bench.csv
+python serial_tester.py --sim          # try the tool without the robot
+```
+
+It uses the same parser, units and sensor list as `mcl.py`, so what it
+accepts, the localizer accepts.
+
+**`R` lines (robot → PC):**
+- The message rate and the worst gap between lines (aim for 10–20/s).
+- The raw text of the last line.
+- Bad lines, with the reason, e.g. `expected 10 fields, got 9`.
+- Odometry in inches and the heading exactly as sent, plus how much each has
+  changed since you pressed Z.
+- Every sensor, with its value, status, min/max seen and invalid count. The
+  status is one of: ok, nothing in range, too close to trust, INVALID (0), or
+  unchanged for a while (a stuck sensor or a value that's never updated).
+- Lines that don't start with `R` are shown under "robot says".
+
+**`C` lines (PC → robot):** hold W/S to drive at `--speed` and A/D to turn at
+`--turn`. The exact line being sent is shown. G and L send the gripper
+commands.
+
+**Scripted tests:** each prints PASS, CHECK, FAIL or INCONCLUSIVE, with what
+to fix.
+
+| Key | Test | What it checks |
+|---|---|---|
+| 1 / 2 | Drive forward / backward for 12 in (speed × time) | Odometry counts the right way and the right amount. Measure the robot too: if both disagree with 12 in, the speed control is off. If only the odometry disagrees, fix the wheel size or encoder counts |
+| 3 / 4 | Turn left / right 90° | The heading sign (left turn = + with `HEADING_CCW_POSITIVE = True`) and its scale. Watch that the robot really turned 90° the right way |
+| 5 | Watchdog | Drives 1 s, then sends **nothing** for 2.5 s. The robot must stop by itself within about 0.5 s. FAIL means the firmware has no command timeout |
+
+`--log file.csv` records every line sent and received, with timestamps, for
+debugging.
 
 ## Notes
 - The maze has look-alike spots. From some starting positions the filter needs

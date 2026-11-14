@@ -101,6 +101,22 @@ def cost_to_goal(grid, goal_cells, avoid=None):
     return dist
 
 
+def fixed_speed(v, w):
+    """FIXED_SPEED_MODE: replace the requested speed / turn rate by one of two
+    fixed magnitudes, keeping the direction. Slow requests (fine alignment,
+    backing onto the block) map to the precise level, everything else to the
+    normal level. v in/s, w rad/s; zero stays zero."""
+    if v != 0.0:
+        mag = (cfg.FIXED_PRECISE_SPEED_IN_S if abs(v) <= cfg.FIXED_PRECISE_BELOW_SPEED_IN_S
+               else cfg.FIXED_SPEED_IN_S)
+        v = math.copysign(mag, v)
+    if w != 0.0:
+        slow = abs(math.degrees(w)) < cfg.FIXED_PRECISE_BELOW_TURN_DEG_S
+        mag = math.radians(cfg.FIXED_PRECISE_TURN_DEG_S if slow else cfg.FIXED_TURN_DEG_S)
+        w = math.copysign(mag, w)
+    return v, w
+
+
 def square_around(grid, cx, cy, size):
     """Integer rectangle (x0, x1, y0, y1) of size x size inches centred near
     (cx, cy), shifted so it stays inside the maze's outer walls."""
@@ -510,6 +526,8 @@ class Navigator:
         v, w = self._step(estimate, ranges, dt, odom, odom_heading)
         if not cfg.ROBOT_CAN_ARC and v != 0.0 and w != 0.0:
             v = 0.0  # last-line guard: never send a combined drive + turn
+        if cfg.FIXED_SPEED_MODE:
+            v, w = fixed_speed(v, w)
         self.last_v = v
         return v, w
 

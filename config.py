@@ -184,6 +184,20 @@ NAV_TURN_MIN_DEG_S = 20.0             # slowest in-place turn sent (beat motor d
 NAV_STRAIGHT_LOOKAHEAD_IN = 10.0      # (no arcs) aim at the farthest path point within
                                       # this distance that is reachable in a straight line
 WANDER_SIDE_TURN_S = 0.3              # (no arcs) turn away this long when a side wall is too close
+# Fixed-speed mode: instead of a range of speeds, every command uses one of
+# two fixed magnitudes (direction kept). Simpler for the firmware's speed
+# control and gives more repeatable odometry.
+#   normal  - driving along paths, wandering, sweeps, big turns
+#   precise - anything the autopilot asks to do slowly: the last few degrees
+#             of lining up a heading, the close-up block sweep, and backing
+#             onto the block (requests at or below the *_BELOW_* limits)
+FIXED_SPEED_MODE = False
+FIXED_SPEED_IN_S = 4.0
+FIXED_TURN_DEG_S = 60.0
+FIXED_PRECISE_SPEED_IN_S = 1.5
+FIXED_PRECISE_TURN_DEG_S = 20.0
+FIXED_PRECISE_BELOW_SPEED_IN_S = 2.5  # requested |speed| <= this -> precise speed
+FIXED_PRECISE_BELOW_TURN_DEG_S = 35.0 # requested |turn| < this -> precise turn rate
 CMD_RATE_HZ = 20                      # how often commands (and P, poses) are sent
 DATA_STALE_S = 1.0                    # no "R," line for this long -> command stop
 # Target 1 (the green zone): cells x0 <= x < x1, y0 <= y < y1 (inches).
