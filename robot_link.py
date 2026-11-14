@@ -2,7 +2,7 @@
 
 Serial protocol (robot -> PC), one ASCII line per sample, '\\n' terminated:
 
-    R,<odom_dist>,<odom_heading_deg>,<front>,<right>,<back>,<left>,<front_left>,<front_right>
+    R,<odom_dist>,<odom_heading_deg>,<front>,<right>,<back>,<left>,<front_left>,<front_right>,<tof>
 
   odom_dist         CUMULATIVE signed distance driven since boot (forward +),
                     in SERIAL_DISTANCE_UNITS. e.g. (left_enc + right_enc) / 2.
@@ -16,9 +16,14 @@ Serial protocol (robot -> PC), one ASCII line per sample, '\\n' terminated:
                     the reading must be ignored. For the IR, send the distance
                     from your voltage-to-distance conversion as-is (no need to
                     handle the < 10 cm fold-back in firmware).
+  tof               rear VL53L0X range (config.TOF_SENSOR), same units/rules.
 
 Any line not starting with "R," is printed as a robot log message.
-Optional PC -> robot (SEND_POSE_TO_ROBOT): "P,<x_in>,<y_in>,<theta_deg>\\n".
+
+PC -> robot:
+  C,<speed>,<turn deg/s>   drive command (see format_command)
+  G / L                    Grip (close the rear gripper) / Leave behind (open it)
+  P,<x_in>,<y_in>,<theta_deg>   pose estimate (only if SEND_POSE_TO_ROBOT)
 """
 import math
 import queue
@@ -37,14 +42,18 @@ UNIT_TO_IN = {"cm": 1 / 2.54, "mm": 1 / 25.4, "in": 1.0}
 class Sample:
     odom_dist_in: float       # cumulative, inches
     odom_heading_rad: float   # cumulative, radians, CLOCKWISE positive (screen)
-    ranges_in: np.ndarray     # inches, NaN = ignore
+    ranges_in: np.ndarray     # inches, NaN = ignore (config.SENSORS order)
+    tof_in: float             # rear ToF, inches, NaN = ignore
+
+
+GRIP_CLOSE, GRIP_OPEN = "G", "L"      # Grip / Leave behind
 
 
 def parse_line(line):
     """Returns a Sample, or None if the line is not a valid data line."""
     parts = line.strip().split(",")
     n = len(cfg.SENSORS)
-    if len(parts) != 3 + n or parts[0] != "R":
+    if len(parts) != 3 + n + 1 or parts[0] != "R":
         return None
     try:
         vals = [float(p) for p in parts[1:]]
@@ -54,9 +63,10 @@ def parse_line(line):
     heading = math.radians(vals[1])
     if cfg.HEADING_CCW_POSITIVE:
         heading = -heading
-    ranges = np.array(vals[2:], dtype=np.float64) * k
+    ranges = np.array(vals[2:2 + n], dtype=np.float64) * k
     ranges[ranges <= 0] = np.nan
-    return Sample(vals[0] * k, heading, ranges)
+    tof = vals[2 + n] * k
+    return Sample(vals[0] * k, heading, ranges, tof if tof > 0 else math.nan)
 
 
 def format_command(v_in_s, w_rad_s):
@@ -165,6 +175,58 @@ class SimulatedRobot:
         self.sim_outlier = maze.sensor_param("sim_outlier")
         self.sim_folds = maze.sensor_param("sim_folds").astype(bool)
         self.manual = False
+        # rear ToF + gripper + the 1 in block, somewhere in target 1
+        self.tof_model = maze.RangeModel(grid, [cfg.TOF_SENSOR])
+        tof_t = cfg.SENSOR_TYPES[cfg.TOF_SENSOR[4]]
+        self.tof_noise, self.tof_noise_prop = tof_t["sim_noise_in"], tof_t["sim_noise_prop"]
+        self.reach = cfg.GRIP_REACH_IN      # gripped block touches the back edge
+        x0, x1, y0, y1 = cfg.GOAL_REGION
+        self.block_x = float(self.rng.uniform(x0 + 0.5, x1 - 0.5))
+        self.block_y = float(self.rng.uniform(y0 + 0.5, y1 - 0.5))
+        self.held = False
+        self.block_bumps = 0     # frames the body overlapped the loose block (for testing)
+
+    def place_block(self, x, y):
+        self.block_x, self.block_y, self.held = float(x), float(y), False
+
+    def _grip_point(self):
+        return (self.x - self.reach * math.cos(self.theta),
+                self.y - self.reach * math.sin(self.theta))
+
+    def tof_reading(self):
+        """Rear ToF: nearest of the wall (map) and the block, if in its cone.
+        Like the real VL53L0X it gives no valid reading (0) below its minimum
+        range, e.g. with the block held against the back edge."""
+        m = self.tof_model
+        if self.held:
+            gap = cfg.REAR_EDGE_IN - abs(cfg.TOF_SENSOR[2])
+            return 0.0 if gap < m.min_in[0] else gap + self.rng.normal(0, 0.1)
+        d = float(m.true_distance(np.array([self.x]), np.array([self.y]),
+                                  np.array([self.theta]))[0, 0])
+        sx, sy, beam = m.sensor_poses(self.x, self.y, self.theta)
+        sx, sy, beam = float(sx[0]), float(sy[0]), float(beam[0])
+        dx, dy = self.block_x - sx, self.block_y - sy
+        dist = math.hypot(dx, dy)
+        half = math.radians(cfg.SENSOR_TYPES["tof"]["beam_deg"]) / 2
+        half_block = math.atan2(cfg.BLOCK_SIZE_IN / 2, max(dist, 0.1))
+        off = abs((math.atan2(dy, dx) - beam + math.pi) % (2 * math.pi) - math.pi)
+        if off <= half + half_block:
+            d = min(d, max(dist - cfg.BLOCK_SIZE_IN / 2, 0.0))
+        if d < m.min_in[0]:
+            return 0.0                      # too close to measure: invalid
+        d += self.rng.normal(0, self.tof_noise + self.tof_noise_prop * d)
+        return float(np.clip(d, m.min_in[0], m.max_in[0]))
+
+    def _push_block(self):
+        """Backing into the loose block pushes it instead of passing through:
+        the block can't get closer to the centre than the back edge."""
+        bx, by = -math.cos(self.theta), -math.sin(self.theta)     # backwards unit vector
+        rx, ry = self.block_x - self.x, self.block_y - self.y
+        along = rx * bx + ry * by                                  # how far behind the centre
+        lateral = -rx * by + ry * bx
+        if 0 < along < self.reach and abs(lateral) <= 3.0:
+            self.block_x += (self.reach - along) * bx
+            self.block_y += (self.reach - along) * by
 
     def drive(self, v, w, dt):
         """v: in/s forward, w: rad/s clockwise."""
@@ -180,6 +242,13 @@ class SimulatedRobot:
         self.theta = (self.theta + dth + math.pi) % (2 * math.pi) - math.pi
         self.odom_dist += d * self.scale_err + self.rng.normal(0, 0.01 * abs(d) + 1e-4)
         self.odom_heading_ccw -= math.degrees(dth) * self.scale_err
+        if self.held:
+            self.block_x, self.block_y = self._grip_point()
+        else:
+            if v < 0:
+                self._push_block()
+            if math.hypot(self.block_x - self.x, self.block_y - self.y) < 3.0:
+                self.block_bumps += 1
 
     def make_line(self):
         k = UNIT_TO_IN[cfg.SERIAL_DISTANCE_UNITS]
@@ -197,7 +266,7 @@ class SimulatedRobot:
         r[outlier] = self.rng.uniform(m.min_in[outlier], m.max_in[outlier])
         r = np.clip(r, m.min_in, m.max_in)
         heading = self.odom_heading_ccw if cfg.HEADING_CCW_POSITIVE else -self.odom_heading_ccw
-        fields = [self.odom_dist / k, heading] + list(r / k)
+        fields = [self.odom_dist / k, heading] + list(r / k) + [self.tof_reading() / k]
         return "R," + ",".join(f"{f:.2f}" for f in fields)
 
     def poll(self, dt, keys):
@@ -233,6 +302,13 @@ class SimulatedRobot:
         cmd = parse_command(text)
         if cmd is not None:
             self.cmd, self.cmd_age = cmd, 0.0
+        elif text.strip() == GRIP_CLOSE:
+            gx, gy = self._grip_point()
+            if math.hypot(gx - self.block_x, gy - self.block_y) <= cfg.SIM_GRIP_CAPTURE_IN:
+                self.held = True
+                self.block_x, self.block_y = gx, gy
+        elif text.strip() == GRIP_OPEN:
+            self.held = False
 
     def close(self):
         pass

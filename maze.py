@@ -62,9 +62,11 @@ def free_cells(grid):
     return np.stack([xs, ys], axis=1).astype(np.float64)
 
 
-def sensor_param(key):
-    """Per-sensor array of SENSOR_TYPES[type][key], in SENSORS order."""
-    return np.array([cfg.SENSOR_TYPES[s[4]][key] for s in cfg.SENSORS], dtype=np.float64)
+def sensor_param(key, sensors=None):
+    """Per-sensor array of SENSOR_TYPES[type][key], in SENSORS order (or the
+    order of the given sensor list)."""
+    sensors = cfg.SENSORS if sensors is None else sensors
+    return np.array([cfg.SENSOR_TYPES[s[4]][key] for s in sensors], dtype=np.float64)
 
 
 def sensor_index():
@@ -134,9 +136,18 @@ def _cone(raw, beam_deg):
     return table
 
 
+_TABLE_CACHE = {}
+
+
 def load_range_tables(grid):
-    """{beam width (deg): table}"""
+    """{beam width (deg): table}. Cached, so several RangeModels share them."""
     key = _table_key(grid)
+    if key not in _TABLE_CACHE:
+        _TABLE_CACHE[key] = _load_range_tables(grid, key)
+    return _TABLE_CACHE[key]
+
+
+def _load_range_tables(grid, key):
     widths = _beam_widths()
     if os.path.exists(cfg.TABLE_FILE):
         data = np.load(cfg.TABLE_FILE)
@@ -155,18 +166,20 @@ def load_range_tables(grid):
 class RangeModel:
     """Looks up expected sensor readings for many poses at once."""
 
-    def __init__(self, grid):
+    def __init__(self, grid, sensors=None):
+        """sensors: list of SENSORS-style tuples (default cfg.SENSORS)."""
+        sensors = cfg.SENSORS if sensors is None else sensors
         tables = load_range_tables(grid)
         self.res = cfg.TABLE_RES_IN
         self.sensor_tables = [tables[float(cfg.SENSOR_TYPES[s[4]]["beam_deg"])]
-                              for s in cfg.SENSORS]
+                              for s in sensors]
         _, self.ny, self.nx = self.sensor_tables[0].shape
-        self.mount_angle = np.radians([s[1] for s in cfg.SENSORS])
-        self.fwd = np.array([s[2] for s in cfg.SENSORS])
-        self.right = np.array([s[3] for s in cfg.SENSORS])
-        self.min_in = sensor_param("min_in")
-        self.max_in = sensor_param("max_in")
-        self.reliable_min_in = sensor_param("reliable_min_in")
+        self.mount_angle = np.radians([s[1] for s in sensors])
+        self.fwd = np.array([s[2] for s in sensors])
+        self.right = np.array([s[3] for s in sensors])
+        self.min_in = sensor_param("min_in", sensors)
+        self.max_in = sensor_param("max_in", sensors)
+        self.reliable_min_in = sensor_param("reliable_min_in", sensors)
 
     def sensor_poses(self, x, y, theta):
         """Returns sx, sy, beam_angle arrays of shape (N, num_sensors)."""

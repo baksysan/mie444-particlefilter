@@ -1,9 +1,17 @@
 # Ultrasonic + IR MCL
 
-Localizes a robot in the 96 × 48 in maze with a particle filter, then drives it
-to a goal. Over a serial (COM) port the robot streams wheel odometry, 4
-ultrasonic ranges (front, right, back, left) and 2 Sharp GP2Y0A21YK IR ranges
-(front-left and front-right, at 45°). The PC sends back drive commands.
+Localizes a robot in the 96 × 48 in maze with a particle filter. It then
+drives to the green zone (target 1), finds a 1 in block there with a rear
+VL53L0X time-of-flight sensor, grips it with the rear gripper, and delivers it
+to target 2, a square you choose for each run.
+
+Over a serial (COM) port the robot streams:
+- wheel odometry
+- 4 ultrasonic ranges (front, right, back, left)
+- 2 Sharp GP2Y0A21YK IR ranges (front-left and front-right, at 45°)
+- the ToF range
+
+The PC sends back drive and gripper commands.
 
 ```
 pip install -r requirements.txt
@@ -28,7 +36,8 @@ is the estimate, and orange lines are the live sensor readings drawn from it.
 | `maze.py` | Maze grid and the precomputed sensor range tables |
 | `particle_filter.py` | The filter: odometry predict, sonar/IR update, resampling, estimate |
 | `robot_link.py` | Serial protocol parser, COM-port reader thread, simulated robot |
-| `navigator.py` | Maze solving: path planning to the goal, path following, modes |
+| `navigator.py` | The mission: path planning, path following, modes, delivering the block |
+| `block_task.py` | Finding the block with the ToF, backing onto it, gripping it |
 | `mcl.py` | Display and main loop |
 | `original_sim/` | The original keyboard-only simulation, kept for reference |
 
@@ -37,17 +46,21 @@ is the estimate, and orange lines are the live sensor readings drawn from it.
 about 10–20 Hz:
 
 ```
-R,<odom_dist>,<odom_heading_deg>,<front>,<right>,<back>,<left>,<front_left>,<front_right>
+R,<odom_dist>,<odom_heading_deg>,<front>,<right>,<back>,<left>,<front_left>,<front_right>,<tof>
 ```
 
 | Field | Meaning |
 |---|---|
-| `odom_dist` | **Cumulative** signed distance since boot, forward positive, e.g. `(left_enc + right_enc) / 2` converted to cm |
+| `odom_dist` | **Cumulative** signed distance since boot in **inches**, forward positive, e.g. `(left_enc + right_enc) / 2` converted to inches |
 | `odom_heading_deg` | **Cumulative** heading change since boot from the encoders, `(right - left) / wheelbase`, **counter-clockwise positive** (left turn = +) |
-| `front` … `left` | Ultrasonic ranges in cm. Send the max-range value (or more) when there's no echo. Send `0` if a sensor failed and its reading must be ignored |
-| `front_left`, `front_right` | Sharp IR ranges in cm, from your voltage-to-distance conversion, sent as-is. Send `80` or more for nothing in range, and `0` for a failed sensor |
+| `front` … `left` | Ultrasonic ranges in inches. Send `47.2` (120 cm) or more when there's no echo. Send `0` if a sensor failed and its reading must be ignored |
+| `front_left`, `front_right` | Sharp IR ranges in inches, from your voltage-to-distance conversion, sent as-is. Send `31.5` (80 cm) or more for nothing in range, and `0` for a failed sensor |
+| `tof` | Rear VL53L0X range in inches (the one under the back sonar; its mm output ÷ 25.4). Send `39.4` (100 cm) or more for nothing in range, and `0` for a failed or invalid reading |
 
-Example: `R,153.20,-87.5,24.1,8.3,120.0,7.9,14.2,31.0`
+Example: `R,60.31,-87.5,9.49,3.27,47.24,3.11,5.59,12.20,8.86`
+
+All distances are in inches (`SERIAL_DISTANCE_UNITS = "in"` in `config.py`;
+`"cm"` and `"mm"` are also supported). Decimals are fine.
 
 - Cumulative values (rather than per-message deltas) mean a dropped or garbled
   line loses no motion.
@@ -73,6 +86,16 @@ Example: `R,153.20,-87.5,24.1,8.3,120.0,7.9,14.2,31.0`
    `SENSOR_TYPES`. Start with the defaults. If the filter loses track, raise
    them. If the particle cloud stays large once the robot is clearly
    localized, lower them.
+6. **Block pickup, measure these:**
+   - `TOF_SENSOR`: the ToF's offset from the rotation centre. The default is
+     3 in straight back.
+   - `REAR_EDGE_IN`: distance from the rotation centre to the back edge of
+     the chassis, where a gripped block touches (the gripper works in a slot
+     there). Default 3 in. If the ToF face is set back from that edge, set
+     `TOF_SENSOR`'s offset to where the ToF really is; the difference is
+     handled automatically.
+   - If pickups miss, tune `BLOCK_MIN_GAP_IN` (how much shorter than the wall
+     a reading must be to count as the block) and `BLOCK_REVERSE_SPEED_IN_S`.
 
 ### How the IR sensors are used
 - **Localization:** they're used like the sonars, but with a narrow beam and
@@ -95,28 +118,60 @@ Example: `R,153.20,-87.5,24.1,8.3,120.0,7.9,14.2,31.0`
     reading. The straight-ahead and sideways sonars can't see those.
   - During path following the robot relies on the map instead.
 
-## Maze solving
-The robot drives to two targets in order:
-1. **Target 1**, the green zone `GOAL_REGION` in `config.py`, labelled "1".
-2. **Target 2**, a 3 ft × 3 ft square (`SECOND_GOAL_SIZE_IN = 36`) that you
-   choose for each run, drawn as the orange "2". Choose it in either of two
-   ways:
-   - **Right-click** anywhere on the map. The square is centred on the click
-     and shifted to stay inside the maze. Right-click again at any time to
-     move it, and the robot re-routes.
-   - **`--target2 X,Y`** on the command line, giving the centre in inches
-     (x 0–98 left to right, y 0–50 top to bottom).
+## The mission
+1. **Drive to target 1**, the green zone `GOAL_REGION` in `config.py`,
+   labelled "1". The robot stops about 6 in **before** entering it
+   (`BLOCK_SEARCH_STANDOFF_IN`). Its ToF faces backwards, so driving in blind
+   could shove a block sitting near an entrance.
+2. **Pick up the block** (`block_task.py`). The status bar shows each step:
+   - **Sweep:** turn slowly on the spot so the rear ToF sweeps 360°. A reading
+     at least `BLOCK_MIN_GAP_IN` (2 in) shorter than the map's wall distance is
+     the block. Two or more readings in a row give its direction, and the
+     shortest one its distance. If nothing is seen, it drives to other spots
+     in the zone (centre, then quarter points) and sweeps again.
+   - **Approach:** choose a side with room to back up. Drive (forwards, around
+     the block) to a staging point 6 in out, then turn the back toward the
+     block.
+   - **Close-up sweep:** ±30° to pin down the block's position, then line the
+     gripper up on it.
+   - **Back up** slowly (2 in/s), guided by the ToF. At contact the block is
+     closer than the VL53L0X can measure (about 3 cm). So once a reading is
+     at or below `TOF_CLOSE_IN` (about 4 cm), or the readings drop out after
+     being close, the robot uses that last good reading as the remaining gap.
+     It backs up exactly that far by odometry, plus `GRIP_CONTACT_EXTRA_IN`
+     (0.2 in), so the block ends up touching the back edge in the slot.
+   - **Grip:** send `G` and wait `GRIP_TIME_S`. Then confirm: with the block
+     against the edge, the ToF reads either nothing (firmware sends `0`) or
+     less than `GRIP_CONFIRM_MAX_IN` (2 in). If it sees something farther
+     away, the grip missed: the robot sends `L` and retries.
+   - Any failed step (not seen, backed up too far, no block at the edge after
+     gripping, timeout) starts a fresh sweep. After 3 failures (`BLOCK_MAX_ATTEMPTS`)
+     the robot stops. Press R to try again.
+3. **Carry it to target 2**, a `SECOND_GOAL_SIZE_IN` square (currently 12 in)
+   that you choose for each run, drawn as the orange "2". The block hangs
+   behind the robot, so the robot picks a drop spot near the square's centre
+   and a robot position about 5 in from it. It drives there, turns the
+   gripper toward the drop spot, sends `L` (leave behind), and pulls 3 in
+   forward.
+4. **Done**: the status bar shows `ARRIVED (done)`.
 
-The current target has the thicker outline, and the status bar shows
-`target 1/2` or `target 2/2`. If target 2 hasn't been chosen when the robot
-reaches target 1, the robot stops in **WAITING** mode
-(`reached target 1 - right-click to choose target 2`). It sets off as soon as
-you right-click.
+**Choosing target 2:**
+- **Right-click** anywhere on the map. The square is centred on the click and
+  shifted to stay inside the maze. Right-click again at any time to move it;
+  while the robot is carrying the block, it re-plans.
+- **`--target2 X,Y`** on the command line, giving the centre in inches (x 0–98
+  left to right, y 0–50 top to bottom).
 
-The square only counts where it covers drivable corridor: the robot has
-arrived once its estimate is at least 2 in inside any corridor part of the
-square. If the square overlaps the green zone, target 2 can be reached almost
-immediately after target 1.
+If target 2 isn't chosen by the time the block is gripped, the robot stops in
+**WAITING** mode (`holding the block - right-click to choose target 2`). It
+sets off as soon as you right-click.
+
+**In the window:**
+- The brown square (sim only) is the real block.
+- The purple box is where the robot thinks the block is, and the purple circle
+  is the staging point.
+- The cyan line is the live ToF reading.
+- The status bar shows the ToF reading and whether the gripper is holding.
 
 The planned path is drawn in purple. The robot works through these modes:
 
@@ -138,12 +193,10 @@ The planned path is drawn in purple. The robot works through these modes:
    The path is planned once over the whole maze and favours the middle of
    corridors, so the robot can recompute its route from wherever the estimate
    says it is.
-3. **Arriving at a target**: this happens once the estimate has been at least
-   2 in inside the target (`NAV_GOAL_MARGIN_IN`) for 0.5 s, **and** the robot
-   has driven at least 24 in in total (`NAV_ARRIVE_MIN_DRIVEN_IN`).
-   - At target 1, the robot switches to target 2, or goes to **WAITING** if
-     target 2 isn't chosen yet.
-   - At target 2, it stops for good (**ARRIVED**).
+3. **Arriving at target 1**: this happens once the estimate has been at least
+   2 in inside the arrival area (`NAV_GOAL_MARGIN_IN`) for 0.5 s, **and** the
+   robot has driven at least 24 in in total (`NAV_ARRIVE_MIN_DRIVEN_IN`). The
+   arrival area ends 6 in before the green zone. Then the block pickup starts.
 
    About the 24 in rule:
    - If the estimate is already in the goal before that, the robot keeps
@@ -192,13 +245,17 @@ In the window, N arms and disarms the autopilot. With a real robot it starts
 **disarmed**, so put the robot in the maze before pressing N. In `--sim`,
 holding W/A/S/D overrides the autopilot.
 
-### Drive commands (PC → robot)
+### Commands (PC → robot)
 ```
-C,<forward speed>,<turn rate deg/s>        e.g.  C,15.24,-45.0
+C,<forward speed in/s>,<turn rate deg/s>   e.g.  C,6.00,-45.0
+G                                          grip: close the rear gripper
+L                                          leave behind: open the rear gripper
 ```
-- **Units and sign:** speed is in `SERIAL_DISTANCE_UNITS` per second (cm/s by
-  default). Turn rate uses the same sign as the odometry heading
-  (counter-clockwise positive).
+Gripper commands are sent once, immediately, only while armed. Disarming or
+quitting does **not** open the gripper, so a held block stays held.
+- **Units and sign:** speed is in `SERIAL_DISTANCE_UNITS` per second (in/s
+  with the current setting), negative for reversing. Turn rate is in deg/s
+  and uses the same sign as the odometry heading (counter-clockwise positive).
 - **Rate:** sent at `CMD_RATE_HZ` (20 Hz), only while armed.
 - **When the PC sends `C,0.00,0.0` (stop):**
   - immediately on disarming (N)
@@ -217,7 +274,11 @@ C,<forward speed>,<turn rate deg/s>        e.g.  C,15.24,-45.0
 4. **Stop if no `C,` line has arrived for about 0.5 s** (PC crash, unplugged
    cable).
 5. **Refuse to drive forward when the front sonar reads under about 2 in.**
-6. Keep streaming `R,` lines the whole time.
+   Don't apply this to reversing: the robot backs onto the block on purpose.
+6. On `G` close the gripper, and on `L` open it. The PC waits
+   `GRIP_TIME_S` (1 s) before moving on, so the gripper must finish within
+   that time.
+7. Keep streaming `R,` lines the whole time, including the ToF field.
 
 The simulated robot follows these same rules.
 

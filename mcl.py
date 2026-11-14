@@ -1,4 +1,5 @@
-"""Localize a robot in the maze and drive it to target 1, then target 2.
+"""Localize a robot in the maze, drive it to target 1, pick up the block there
+with the rear gripper, and carry it to target 2.
 
     python mcl.py --port COM5                    # real robot over serial
     python mcl.py --sim                          # fake robot
@@ -7,7 +8,7 @@
 
 In the window: R = re-scatter particles (global localization),
 left-click = "the robot is about here" (seeds particles around the click),
-right-click = place target 2 (a 3 ft square centred on the click; can be
+right-click = place target 2 (a SECOND_GOAL_SIZE_IN square centred on the click; can be
 changed at any time), N = autopilot on/off, Esc = quit.
 In --sim, W/A/S/D drive manually (overrides the autopilot while held).
 """
@@ -29,6 +30,7 @@ BLUE, LIGHT_BLUE = (40, 90, 220), (200, 215, 245)
 GREEN, ORANGE, GREY = (0, 170, 0), (255, 140, 0), (90, 90, 90)
 GOAL_FILL, PATH = (205, 240, 205), (150, 60, 200)
 T2_COLOR, T2_FILL = (230, 120, 0), (255, 170, 60, 70)   # target 2 outline / translucent fill
+BLOCK_TRUE, BLOCK_EST, TOF_RAY = (120, 70, 20), (150, 60, 200), (0, 170, 200)
 STATUS_H = 104
 
 
@@ -115,7 +117,8 @@ def main():
     pf = ParticleFilter(grid, model)
     loc = Localizer(pf)
     link = SimulatedRobot(grid, model) if args.sim else SerialRobot(args.port, args.baud)
-    nav = Navigator(grid)
+    tof_model = maze.RangeModel(grid, [cfg.TOF_SENSOR])
+    nav = Navigator(grid, tof_model)
     if args.target2:
         try:
             tx, ty = (float(v) for v in args.target2.split(","))
@@ -197,8 +200,13 @@ def main():
             # latest command is sent, at CMD_RATE_HZ.
             odom = loc.last.odom_dist_in if loc.last is not None else None
             heading = loc.last.odom_heading_rad if loc.last is not None else None
-            v, w = nav.step(est, loc.last_ranges, dt, odom, heading)
+            tof = loc.last.tof_in if loc.last is not None else math.nan
+            v, w = nav.step(est, loc.last_ranges, dt, odom, heading, tof, loc.samples)
             cmd = STOP if stale else format_command(v, w)  # never steer on old data
+            for out in nav.outbox:                         # gripper commands: send now
+                link.send(out)
+                print(f"-> robot: {out}")
+            nav.outbox.clear()
         if now >= next_send:
             # fixed schedule (not now + period) so frame timing doesn't lower the rate
             next_send = max(next_send + send_period, now - send_period)
@@ -229,6 +237,20 @@ def main():
 
         if args.sim:
             draw_pose(win, link.x, link.y, link.theta, GREEN, cfg.PPI * 3)
+            b = int(cfg.BLOCK_SIZE_IN * cfg.PPI)
+            pygame.draw.rect(win, BLOCK_TRUE, (int(link.block_x * cfg.PPI) - b // 2,
+                                               int(link.block_y * cfg.PPI) - b // 2, b, b))
+        if nav.block is not None and nav.block.block is not None and nav.phase == "BLOCK":
+            bx, by = nav.block.block       # where the robot thinks the block is
+            pygame.draw.rect(win, BLOCK_EST, (int(bx * cfg.PPI) - 9, int(by * cfg.PPI) - 9, 18, 18), 2)
+            if nav.block.stage_pt is not None:
+                sp = nav.block.stage_pt
+                pygame.draw.circle(win, BLOCK_EST, (int(sp[0] * cfg.PPI), int(sp[1] * cfg.PPI)), 5, 1)
+        if loc.last is not None and np.isfinite(loc.last.tof_in):
+            tsx, tsy, tb = tof_model.sensor_poses(mx, my, mt)
+            a = (tsx[0] * cfg.PPI, tsy[0] * cfg.PPI)
+            r = loc.last.tof_in * cfg.PPI
+            pygame.draw.line(win, TOF_RAY, a, (a[0] + r * math.cos(tb[0]), a[1] + r * math.sin(tb[0])), 2)
 
         # measured ranges drawn from the estimated pose
         if loc.last_ranges is not None:
@@ -267,7 +289,8 @@ def main():
         lines = [
             f"{link.name} | {rate:4.1f} msg/s | samples {loc.samples} fused {loc.fusions} | {state}",
             f"pose x={mx:5.1f} y={my:5.1f} th={math.degrees(mt):6.1f}deg  spread {spread:4.1f} in  conf {conf:4.0%}",
-            f"ranges (in): {ranges}",
+            f"ranges (in): {ranges}   ToF={'--' if loc.last is None or not np.isfinite(loc.last.tof_in) else f'{loc.last.tof_in:.1f}'}"
+            f"   gripper: {'HOLDING block' if nav.holding else 'open'}",
             f"autopilot: {drive}",
             "R = re-scatter  click = seed here  right-click = target 2  N = autopilot  Esc = quit"
             + ("  WASD = drive" if args.sim else ""),

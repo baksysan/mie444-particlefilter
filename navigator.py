@@ -1,13 +1,18 @@
 """Maze solving on top of the localizer: plan on the known map, follow the plan.
 
-Targets: target 1 (GOAL_REGION, the green zone), then target 2 (a square the
-user picks per run). Each has its own cost-to-goal field.
+Mission (self.phase):
+  TARGET1   drive to target 1 (GOAL_REGION, the green zone)
+  BLOCK     find the 1 in block there with the rear ToF and grip it (block_task.py)
+  TARGET2   carry it to target 2 (a SECOND_GOAL_SIZE_IN square the user picks per run)
+  RELEASE   open the gripper (L, "leave behind") and pull forward
+  DONE
+Each target has its own cost-to-goal field.
 
-Modes
+Modes (how it is driving right now)
   LOCALIZE  filter not confident yet: wander using raw sensor readings only
-  NAVIGATE  follow the current target's cost field downhill from the estimate
-  WAITING   reached target 1 but no target 2 chosen yet; stopped
-  ARRIVED   reached the last target; stopped
+  NAVIGATE  localized: carry out the current phase
+  WAITING   holding the block but no target 2 chosen yet; stopped
+  ARRIVED   mission complete; stopped
 """
 import heapq
 import math
@@ -16,9 +21,12 @@ import numpy as np
 
 import config as cfg
 import maze
+from block_task import BlockTask
 from particle_filter import wrap_angle
+from robot_link import GRIP_OPEN
 
 LOCALIZE, NAVIGATE, WAITING, ARRIVED = "LOCALIZE", "NAVIGATE", "WAITING", "ARRIVED"
+TARGET1, BLOCK, TARGET2, RELEASE, DONE = "TARGET1", "BLOCK", "TARGET2", "RELEASE", "DONE"
 NEIGHBOURS = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
 
 
@@ -60,10 +68,17 @@ def _distance_from(blocked):
     return clear
 
 
-def cost_to_goal(grid, goal_cells):
+def cost_to_goal(grid, goal_cells, avoid=None):
     """Dijkstra from the goal cells over FREE cells (8-connected). Cells near
-    corridor edges cost more, so paths run down the middle of corridors."""
+    corridor edges cost more, so paths run down the middle of corridors.
+    avoid = (x, y, r): treat cells within r inches of (x, y) as blocked (e.g.
+    the loose block, so the robot doesn't drive over it)."""
     h, w = grid.shape
+    if avoid is not None:
+        ax, ay, ar = avoid
+        yy, xx = np.mgrid[0:h, 0:w]
+        near = (xx + 0.5 - ax) ** 2 + (yy + 0.5 - ay) ** 2 < ar ** 2
+        grid = np.where(near & ~goal_cells, maze.BLOCKED, grid)
     clear = clearance_map(grid)
     dist = np.full((h, w), np.inf)
     heap = []
@@ -100,18 +115,67 @@ def square_around(grid, cx, cy, size):
 class Goal:
     """A target rectangle with its arrival cells and cost-to-goal field."""
 
-    def __init__(self, grid, rect):
+    def __init__(self, grid, rect, avoid=None):
         self.rect = tuple(int(v) for v in rect)
         self.cells = goal_mask(grid, self.rect, cfg.NAV_GOAL_MARGIN_IN)
-        self.dist = cost_to_goal(grid, self.cells)
+        self.dist = cost_to_goal(grid, self.cells, avoid)
+
+
+def plan_drop(grid, rect, x, y, safe=None):
+    """Where to put the block in target 2. The block hangs `reach` inches
+    behind the robot centre, so choose a drop spot D inside the square (as
+    central as possible) and a robot position P = D + reach * (direction phi)
+    that is drivable. Returns (P, phi, D) or None. The robot drives to P,
+    turns to heading phi (back toward D) and opens the gripper."""
+    reach = cfg.GRIP_REACH_IN
+    if safe is None:
+        safe = clearance_map(grid) >= 2   # robot positions ~1 in inside the corridor
+    x0, x1, y0, y1 = rect
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    m = cfg.BLOCK_SIZE_IN                 # keep the whole block inside the square
+    best = None
+    for dy in np.arange(y0 + m, y1 - m + 1e-9, 1.0):
+        for dx in np.arange(x0 + m, x1 - m + 1e-9, 1.0):
+            if grid[int(dy), int(dx)] == maze.WALL:
+                continue
+            for k in range(24):
+                phi = k * math.pi / 12
+                px, py = dx + reach * math.cos(phi), dy + reach * math.sin(phi)
+                if not (0 <= py < grid.shape[0] and 0 <= px < grid.shape[1]) or not safe[int(py), int(px)]:
+                    continue
+                # prefer a central drop spot, then a short drive
+                cost = 3.0 * math.hypot(dx - cx, dy - cy) + math.hypot(px - x, py - y) / 10
+                if best is None or cost < best[0]:
+                    best = (cost, (px, py), phi, (float(dx), float(dy)))
+    return None if best is None else best[1:]
 
 
 class Navigator:
-    def __init__(self, grid):
+    def __init__(self, grid, tof_model=None):
+        """tof_model: RangeModel for config.TOF_SENSOR. Without it the block
+        step is skipped (target 1 -> target 2 directly)."""
         self.grid = grid
-        self.goals = [Goal(grid, cfg.GOAL_REGION), None]   # target 2 is set per run
+        if tof_model is not None:
+            # block mission: "reach" target 1 a little before entering it, so
+            # the first ToF sweep happens before driving over the zone blind
+            s = cfg.BLOCK_SEARCH_STANDOFF_IN
+            x0, x1, y0, y1 = cfg.GOAL_REGION
+            h, w = grid.shape
+            g1 = Goal(grid, (max(x0 - s, 0), min(x1 + s, w), max(y0 - s, 0), min(y1 + s, h)))
+            g1.rect = tuple(cfg.GOAL_REGION)    # drawn / searched as the real zone
+        else:
+            g1 = Goal(grid, cfg.GOAL_REGION)
+        self.goals = [g1, None]                            # target 2 is set per run
         self.stage = 0                                     # index of the current target
         self._activate(0)
+        self.phase = TARGET1
+        self.block = BlockTask(self, grid, tof_model) if tof_model is not None else None
+        self.holding = False
+        self.outbox = []           # commands for the robot (gripper), sent by mcl.py
+        self.release_time = 0.0
+        self.drop = None           # (robot pos, heading, drop spot) for target 2
+        self.drop_state = "goto"
+        self.drop_timer = 0.0
         # Straight-line moves must stay ~1 in inside the corridor, so a small
         # estimate error doesn't clip an inside corner.
         self.safe = clearance_map(grid) >= 2
@@ -143,11 +207,35 @@ class Navigator:
 
     # --------------------------------------------------------------- targets
     def _activate(self, stage):
-        g = self.goals[stage]
         self.stage = stage
+        self._use_goal(self.goals[stage])
+        self.drop = None                  # (re)plan where to put the block
+
+    def _use_goal(self, g):
+        self.avoid_zone = None
         self.goal, self.goal_cells, self.dist = g.rect, g.cells, g.dist
         self.best_dist, self.no_progress_time, self.arrive_time = math.inf, 0.0, 0.0
         self.aligning = False
+
+    def set_point_goal(self, x, y, avoid=None):
+        """Drive to the 1 in cell containing (x, y) (used by the block task).
+        avoid = (x, y, r): keep the path's centre line away from that spot."""
+        cx, cy = int(math.floor(x)), int(math.floor(y))
+        self._use_goal(Goal(self.grid, (cx, cx + 1, cy, cy + 1), avoid))
+        self.avoid_zone = avoid
+
+    def follow_current(self, x, y, theta):
+        return self._follow(x, y, theta)
+
+    def on_block_gripped(self):
+        """Called by the block task once the block is in the gripper."""
+        self.holding = True
+        self.phase = TARGET2
+        if self.goals[1] is None:
+            self.mode = WAITING
+            self._use_goal(self.goals[0])
+        else:
+            self._activate(1)
 
     def set_second_goal(self, cx, cy):
         """Place target 2: a SECOND_GOAL_SIZE_IN square centred near (cx, cy)
@@ -159,11 +247,10 @@ class Navigator:
             self.goals[1] = Goal(self.grid, rect)
         except ValueError:
             return f"target 2 at {rect} has no drivable corridor inside it"
-        if self.stage == 1:
+        if self.phase == TARGET2:
             self._activate(1)
-        if self.mode == WAITING:
-            self._activate(1)
-            self.mode = NAVIGATE
+            if self.mode == WAITING:
+                self.mode = NAVIGATE
         return None
 
     @property
@@ -171,10 +258,16 @@ class Navigator:
         return self.goals[1].rect if self.goals[1] is not None else None
 
     def target_label(self):
-        return f"target {self.stage + 1}/{len(self.goals)}"
+        return {TARGET1: "-> target 1", BLOCK: "picking up block",
+                TARGET2: "-> target 2 with block", RELEASE: "releasing block",
+                DONE: "done"}[self.phase]
 
     def reset(self):
-        """Restart localization (keeps which target it is on)."""
+        """Restart localization (keeps which phase it is in). A block task
+        that gave up is started again."""
+        if self.phase == BLOCK and self.block is not None and self.block.state == "failed":
+            self.block.attempts = 0
+            self.block._enter("sweep")
         self.mode = LOCALIZE
         self.good_time = self.arrive_time = self.no_progress_time = 0.0
         self.best_dist = math.inf
@@ -233,6 +326,10 @@ class Navigator:
         inside = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
         free = np.zeros(n, dtype=bool)
         free[inside] = self.safe[yi[inside], xi[inside]]
+        if self.avoid_zone is not None:
+            ax, ay, ar = self.avoid_zone
+            px, py = x0 + t * (x1 - x0), y0 + t * (y1 - y0)
+            free &= (px - ax) ** 2 + (py - ay) ** 2 >= ar ** 2
         if not free.any():
             return False
         first = int(np.argmax(free))
@@ -242,6 +339,8 @@ class Navigator:
         """Farthest path point within NAV_STRAIGHT_LOOKAHEAD_IN that can be
         reached in a straight line, so straight driving never cuts a corner.
         If none is, head for the centre of the current cell first."""
+        if len(self.path) <= 2 and math.hypot(self.path[-1][0] - x, self.path[-1][1] - y) < 2.0:
+            return self.path[-1]          # destination is right here: go straight at it
         best = self.path[0]
         travelled, px, py = 0.0, x, y
         for qx, qy in self.path[1:]:
@@ -399,16 +498,56 @@ class Navigator:
                 self.wander_dir = 1 if right >= left else -1
         return 0.0, self.wander_dir * 0.7 * math.radians(cfg.NAV_TURN_MAX_DEG_S)
 
-    def step(self, estimate, ranges, dt, odom=None, odom_heading=None):
+    def step(self, estimate, ranges, dt, odom=None, odom_heading=None,
+             tof=math.nan, sample_id=None):
         """estimate = ParticleFilter.estimate(); ranges = last sensor readings
         (inches, NaN = missing) or None; odom / odom_heading = latest
-        cumulative odometry distance (inches) and heading (radians), or None.
-        Returns (v in/s, w rad/s clockwise)."""
+        cumulative odometry distance (inches) and heading (radians), or None;
+        tof = latest rear ToF reading (inches, NaN = none); sample_id changes
+        whenever a new sample arrived. Returns (v in/s, w rad/s clockwise).
+        Gripper commands are left in self.outbox."""
+        self._tof, self._sample_id = tof, sample_id
         v, w = self._step(estimate, ranges, dt, odom, odom_heading)
         if not cfg.ROBOT_CAN_ARC and v != 0.0 and w != 0.0:
             v = 0.0  # last-line guard: never send a combined drive + turn
         self.last_v = v
         return v, w
+
+    def _deliver(self, x, y, theta, dt):
+        """Carry the block to target 2: drive to the planned drop pose, turn
+        the gripper toward the drop spot, then hand over to RELEASE."""
+        if self.drop is None:
+            self.drop = plan_drop(self.grid, self.goals[1].rect, x, y, self.safe)
+            self.drop_state, self.drop_timer = "goto", 0.0
+            if self.drop is None:
+                self.wait_reason = "no drivable spot to drop the block in target 2 - move target 2"
+                self.path, self.target = [], None
+                return 0.0, 0.0
+            self.set_point_goal(*self.drop[0])
+        (px, py), phi, _ = self.drop
+        self.drop_timer += dt
+        if self.drop_timer > 2 * cfg.BLOCK_TASK_TIMEOUT_S:
+            self.drop = None              # taking too long: re-plan from here
+            return 0.0, 0.0
+        if self.drop_state == "goto":
+            self.wait_reason = "carrying block to target 2"
+            if self.in_goal(x, y):
+                self.drop_state = "turn"
+                self.path, self.target = [], None
+                return 0.0, 0.0
+            return self._follow(x, y, theta)
+        # turn so the gripper (back) faces the drop spot
+        self.wait_reason = "turning gripper toward drop spot"
+        err = wrap_angle(phi - theta)
+        if abs(err) > math.radians(3):
+            w_max = math.radians(cfg.NAV_TURN_MAX_DEG_S)
+            rate = float(np.clip(cfg.NAV_TURN_GAIN * abs(err), math.radians(cfg.NAV_TURN_MIN_DEG_S), w_max))
+            return 0.0, math.copysign(rate, err)
+        self.phase = RELEASE
+        self.release_time = 0.0
+        self.outbox.append(GRIP_OPEN)
+        self.holding = False
+        return 0.0, 0.0
 
     def _update_travel(self, odom, odom_heading):
         if odom is not None:
@@ -456,11 +595,13 @@ class Navigator:
         self.good_time = self.good_time + dt if good else 0.0
 
         if self.mode in (ARRIVED, WAITING):
-            if bad:
+            if bad and self.mode == WAITING:
                 self.reset()  # we weren't where we thought: start over
             else:
                 if self.mode == WAITING:
-                    self.wait_reason = "reached target 1 - right-click to choose target 2"
+                    self.wait_reason = ("holding the block - right-click to choose target 2"
+                                        if self.holding else
+                                        "reached target 1 - right-click to choose target 2")
                 return 0.0, 0.0
 
         if (self.mode == LOCALIZE and self.good_time >= cfg.NAV_START_HOLD_S
@@ -468,8 +609,36 @@ class Navigator:
                 and self.straight >= cfg.NAV_MIN_STRAIGHT_IN and self.cooldown <= 0):
             self.mode = NAVIGATE
             self.best_dist, self.no_progress_time = math.inf, 0.0
+            if self.phase == BLOCK:
+                self.block.resume()
+            elif self.phase == TARGET2 and self.goals[1] is None:
+                self.mode = WAITING
+                return 0.0, 0.0
         elif self.mode == NAVIGATE and bad:
             self.mode = LOCALIZE
+
+        if self.mode == NAVIGATE and self.phase == BLOCK:
+            v, w = self.block.step(x, y, theta, self._tof, self._sample_id,
+                                   odom, odom_heading, dt)
+            self.wait_reason = self.block.status
+            if self.block.state not in ("goto_view", "goto_stage"):
+                self.path, self.target = [], None
+            return v, w
+
+        if self.mode == NAVIGATE and self.phase == TARGET2 and self.holding:
+            return self._deliver(x, y, theta, dt)
+
+        if self.mode == NAVIGATE and self.phase == RELEASE:
+            self.release_time += dt
+            self.path, self.target = [], None
+            if self.release_time < cfg.GRIP_TIME_S:
+                self.wait_reason = "opening gripper"
+                return 0.0, 0.0
+            if self.release_time < cfg.GRIP_TIME_S + cfg.BLOCK_RELEASE_CLEAR_IN / 3.0:
+                self.wait_reason = "pulling away from the block"
+                return 3.0, 0.0
+            self.phase, self.mode = DONE, ARRIVED
+            return 0.0, 0.0
 
         if self.mode == NAVIGATE:
             cx, cy = self._cell(x, y)
@@ -495,13 +664,23 @@ class Navigator:
                 self.arrive_time += dt
                 if self.arrive_time >= cfg.NAV_ARRIVE_HOLD_S:
                     self.path, self.target = [], None
-                    nxt = self.stage + 1
-                    if nxt >= len(self.goals):
-                        self.mode = ARRIVED          # last target reached
-                    elif self.goals[nxt] is None:
-                        self.mode = WAITING          # target 2 not chosen yet
-                    else:
-                        self._activate(nxt)          # on to the next target
+                    if self.phase == TARGET1 and self.block is not None:
+                        self.phase = BLOCK           # now find and grip the block
+                        self.block.start(x, y)
+                    elif self.phase == TARGET1:      # no ToF configured: straight on
+                        self.phase = TARGET2
+                        if self.goals[1] is None:
+                            self.mode = WAITING
+                        else:
+                            self._activate(1)
+                    elif self.phase == TARGET2:
+                        if self.holding:
+                            self.phase = RELEASE     # let go of the block
+                            self.release_time = 0.0
+                            self.outbox.append(GRIP_OPEN)
+                            self.holding = False
+                        else:
+                            self.phase, self.mode = DONE, ARRIVED
                     return 0.0, 0.0
             else:
                 self.arrive_time = 0.0

@@ -11,7 +11,7 @@ import math
 # --------------------------------------------------------------------------
 SERIAL_PORT = "COM3"          # override with --port COM5
 SERIAL_BAUD = 115200          # override with --baud
-SERIAL_DISTANCE_UNITS = "cm"  # units of odometry distance and ranges in the
+SERIAL_DISTANCE_UNITS = "in"  # units of odometry distance and ranges in the
                               # robot's messages: "cm", "mm" or "in"
 # Robot reports heading counter-clockwise positive (standard math / ROS
 # convention: turning LEFT increases heading). Set False if your firmware
@@ -65,7 +65,48 @@ SENSOR_TYPES = {
                sigma_base=0.5, sigma_prop=0.06, random_prob=0.05,
                sim_noise_in=0.2, sim_noise_prop=0.03, sim_outlier=0.01,
                sim_folds=True),
+    # VL53L0X time-of-flight: ~25 deg field of view, 3-100 cm usable
+    "tof": dict(beam_deg=25.0, min_in=3.0 / 2.54, max_in=100.0 / 2.54,
+                reliable_min_in=3.0 / 2.54,
+                sigma_base=0.3, sigma_prop=0.03, random_prob=0.05,
+                sim_noise_in=0.15, sim_noise_prop=0.02, sim_outlier=0.01,
+                sim_folds=False),
 }
+
+# --------------------------------------------------------------------------
+# Block pickup. A 1 in block sits somewhere in target 1 (the green zone), too
+# low for the sonars/IRs. A VL53L0X on the BACK of the robot (under the back
+# sonar) finds it; the gripper is also on the back. The ToF is NOT used for
+# localization, only for finding and approaching the block.
+#   Same tuple format as SENSORS. Its reading is the LAST field of each R line.
+# --------------------------------------------------------------------------
+TOF_SENSOR = ("tof", 180.0, -3.0, 0.0, "tof")
+BLOCK_SIZE_IN = 1.0
+# The gripper works in a slot in the chassis: a gripped block sits touching the
+# robot's back edge. MEASURE: distance from the rotation centre (midpoint
+# between the wheels) to that back edge.
+REAR_EDGE_IN = 3.0
+GRIP_REACH_IN = REAR_EDGE_IN + BLOCK_SIZE_IN / 2   # rotation centre -> centre of a gripped block
+# At contact the block is closer to the ToF than the VL53L0X can measure
+# (~3 cm), so the last stretch is driven by odometry:
+TOF_CLOSE_IN = 1.6                    # once a valid ToF reading is <= this (~4 cm)...
+GRIP_CONTACT_EXTRA_IN = 0.2           # ...back up the measured remaining gap plus this, by odometry
+GRIP_CONFIRM_MAX_IN = 2.0             # after G: ToF must read below this (or nothing) = block present
+GRIP_TIME_S = 1.0                     # wait this long after G / L for the gripper to move
+BLOCK_MIN_GAP_IN = 2.0                # ToF must read this much shorter than the map's
+                                      # wall distance to count as "block"
+BLOCK_SWEEP_DEG_S = 45.0              # turning speed while sweeping the ToF
+BLOCK_REFINE_HALF_DEG = 30.0          # close-up sweep: +-this around the expected bearing
+BLOCK_STAGE_GAP_IN = 6.0              # staging point: this much farther out than the pickup pose
+BLOCK_REVERSE_SPEED_IN_S = 2.0        # backing onto the block
+BLOCK_RELEASE_CLEAR_IN = 3.0          # after letting go at target 2, drive forward this far
+BLOCK_MAX_ATTEMPTS = 3                # pickup attempts before giving up
+BLOCK_TASK_TIMEOUT_S = 30.0           # any single search/approach step taking longer -> retry
+SIM_GRIP_CAPTURE_IN = 1.0             # (sim) block must be this close to the slot to be gripped
+# Stop this far OUTSIDE target 1 and sweep from there first: the ToF faces
+# backwards, so driving into the zone blind could shove a block that sits
+# near an entrance.
+BLOCK_SEARCH_STANDOFF_IN = 6
 # Raise each update's likelihood to this power (<1 = trust each reading less).
 # Consecutive sonar readings have correlated errors; without this the filter
 # gets overconfident and can lock onto a look-alike spot in the maze.
