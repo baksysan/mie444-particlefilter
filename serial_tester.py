@@ -19,7 +19,15 @@ Keys
   3            test: turn left  90 deg
   4            test: turn right 90 deg
   5            test: watchdog - stop sending commands, robot must stop itself
+  6 / 7        small step: drive forward / backward 3 in    (half speed)
+  8 / 9        small step: turn left / right 15 deg         (half turn rate)
+  M            measure: hold still 3 s, then report each sensor's average,
+               noise and spikes - compare the averages with a tape measure
   Esc          stop and quit
+
+For the small steps, what matters is that the ODOMETRY matches what the robot
+REALLY did (mark the floor / measure the angle), not that it hit 3 in or 15 deg
+exactly: the wheels need a moment to speed up, so short moves come up short.
 
 The protocol, units and sensor list come from config.py, exactly as mcl.py
 uses them.
@@ -87,8 +95,10 @@ class SensorStats:
 class Test:
     """Timed open-loop move, then compare with what the odometry reports."""
 
-    def __init__(self, name, v_in_s, w_ccw_deg_s, duration, expect_dist_in, expect_turn_deg):
+    def __init__(self, name, v_in_s, w_ccw_deg_s, duration, expect_dist_in, expect_turn_deg,
+                 tol=0.15):
         self.name, self.v, self.w_ccw = name, v_in_s, w_ccw_deg_s
+        self.tol = tol          # PASS if odometry is within this fraction of the command
         self.duration = duration
         self.expect_dist, self.expect_turn = expect_dist_in, expect_turn_deg
         self.t0 = None
@@ -112,11 +122,12 @@ class Tester:
         self.bad_lines = 0
         self.last_bad = ""
         self.robot_logs = deque(maxlen=4)
-        self.results = deque(maxlen=9)
+        self.results = deque(maxlen=12)
         self.cmd = format_command(0, 0)
         self.manual_cmd = self.cmd
         self.test = None
         self.watchdog = None
+        self.measure = None                 # sensor measurement in progress
         self.sending = True
         self.next_send = 0.0
         self.history = deque(maxlen=400)    # (t, odom_in, heading_fw_deg)
@@ -149,6 +160,9 @@ class Tester:
         heading_fw = float(parts[2])        # degrees, exactly as the firmware sent it
         for st, v in zip(self.sensors, list(s.ranges_in) + [s.tof_in]):
             st.update(v)
+        if self.measure is not None:
+            self.measure["samples"].append(list(s.ranges_in) + [s.tof_in])
+            self.measure["odom"].append((s.odom_dist_in, heading_fw))
         self.arrivals.append(now)
         self.last_parsed = (now, s.odom_dist_in, heading_fw)
         self.history.append(self.last_parsed)
@@ -193,7 +207,13 @@ class Tester:
             2: Test("backward 12 in", -v, 0, dist / v, -dist, 0),
             3: Test("turn left 90 deg", 0, t, ang / t, 0, ang),
             4: Test("turn right 90 deg", 0, -t, ang / t, 0, -ang),
+            # small steps at half speed: short moves lose more to speeding up
+            6: Test("step forward 3 in", v / 2, 0, 3.0 / (v / 2), 3.0, 0, tol=0.3),
+            7: Test("step backward 3 in", -v / 2, 0, 3.0 / (v / 2), -3.0, 0, tol=0.3),
+            8: Test("step left 15 deg", 0, t / 2, 15.0 / (t / 2), 0, 15.0, tol=0.3),
+            9: Test("step right 15 deg", 0, -t / 2, 15.0 / (t / 2), 0, -15.0, tol=0.3),
         }
+        self.measure = None
         self.watchdog = None
         self.test = tests[n]
         self.result(f"TEST {self.test.name}: {self.test.command()} for {self.test.duration:.1f} s", HEAD_C)
@@ -205,6 +225,62 @@ class Tester:
         self.test = None
         self.watchdog = {"t0": now, "phase": "drive"}
         self.result(f"TEST watchdog: drive {self.speed:g} in/s for 1 s, then send NOTHING for 2.5 s", HEAD_C)
+
+    MEASURE_S = 3.0
+
+    def start_measure(self, now):
+        if self.last_parsed is None:
+            self.result("No R lines yet - can't measure", BAD_C)
+            return
+        self.test = self.watchdog = None
+        self.measure = {"t0": now, "samples": [], "odom": []}
+        self.result(f"MEASURE: hold the robot still for {self.MEASURE_S:.0f} s...", HEAD_C)
+
+    def step_measure(self, now):
+        m = self.measure
+        if m is None:
+            return
+        self.cmd = format_command(0, 0)
+        if now - m["t0"] < self.MEASURE_S:
+            return
+        self.measure = None
+        a = np.array(m["samples"], dtype=float)      # rows = R lines, cols = sensors (inches)
+        if len(a) < 5:
+            self.result("  CHECK: too few R lines to measure", BAD_C)
+            return
+        self.result(f"  {len(a)} R lines. Sensor   average   noise(sd)  min..max      notes", FG)
+        for j, st in enumerate(self.sensors):
+            col = a[:, j]
+            good = col[np.isfinite(col)]
+            n_bad = len(col) - len(good)
+            if len(good) == 0:
+                self.result(f"  {st.name:12s}  no valid readings at all ({n_bad}/{len(col)})", BAD_C)
+                continue
+            far = good >= st.max_in - 1e-6
+            mean, sd = good.mean(), good.std()
+            # a spike = a reading more than 3 in from the typical (median) value
+            spikes = int(np.sum(np.abs(good - np.median(good)) > 3.0))
+            flags = []
+            if n_bad:
+                flags.append(f"{n_bad} invalid")
+            if far.all():
+                flags.append("all out of range")
+            elif far.any():
+                flags.append(f"{int(far.sum())} out of range")
+            if sd > 1.0:
+                flags.append("NOISY")
+            if spikes:
+                flags.append(f"{spikes} spikes")
+            c = OK_C if not flags else (WARN_C if sd <= 1.5 and not n_bad else BAD_C)
+            self.result(f"  {st.name:12s} {mean:6.1f} in   {sd:5.2f}    {good.min():5.1f}..{good.max():5.1f}"
+                        f"   {', '.join(flags) or 'steady'}", c)
+        od = np.array(m["odom"])
+        drift_d, drift_h = od[-1, 0] - od[0, 0], od[-1, 1] - od[0, 1]
+        if abs(drift_d) > 0.05 or abs(drift_h) > 0.5:
+            self.result(f"  odometry CHANGED while still: {drift_d:+.2f} in, {drift_h:+.1f} deg "
+                        f"(encoder noise?)", BAD_C)
+        else:
+            self.result("  odometry steady while still", OK_C)
 
     def step_test(self, now):
         t = self.test
@@ -229,23 +305,25 @@ class Tester:
 
     def report(self, t, d, h, exp_h):
         self.result(f"  odometry: distance {d:+.2f} in ({fmt_units(d)}), heading {h:+.1f} deg", FG)
+        lo, hi = 1 - t.tol, 1 + t.tol
         if t.expect_dist:
-            sign_ok = math.copysign(1, d) == math.copysign(1, t.expect_dist) and abs(d) > 0.5
+            sign_ok = (math.copysign(1, d) == math.copysign(1, t.expect_dist)
+                       and abs(d) > 0.15 * abs(t.expect_dist))
             ratio = d / t.expect_dist
-            ok = sign_ok and 0.85 <= ratio <= 1.15
+            ok = sign_ok and lo <= ratio <= hi
             self.result(f"  {'PASS' if ok else 'CHECK'}: expected {t.expect_dist:+.1f} in "
                         f"({ratio:.0%} of it). Measure the robot: did it really move "
-                        f"{abs(t.expect_dist):.0f} in? Heading drift {h:+.1f} deg.",
+                        f"{abs(d):.1f} in? Heading drift {h:+.1f} deg.",
                         OK_C if ok else BAD_C)
             if not sign_ok:
                 self.result("  -> wrong sign or no motion: odometry must count forward as +", BAD_C)
         else:
-            sign_ok = math.copysign(1, h) == math.copysign(1, exp_h) and abs(h) > 5
+            sign_ok = math.copysign(1, h) == math.copysign(1, exp_h) and abs(h) > 0.15 * abs(exp_h)
             ratio = h / exp_h
-            ok = sign_ok and 0.85 <= ratio <= 1.15
+            ok = sign_ok and lo <= ratio <= hi
             side = "LEFT (counter-clockwise)" if t.w_ccw > 0 else "RIGHT (clockwise)"
             self.result(f"  {'PASS' if ok else 'CHECK'}: expected heading {exp_h:+.0f} deg "
-                        f"({ratio:.0%} of it). Look: did it turn ~90 deg to the {side}? "
+                        f"({ratio:.0%} of it). Look: did it really turn {abs(h):.0f} deg to the {side}? "
                         f"Distance drift {d:+.2f} in.", OK_C if ok else BAD_C)
             if not sign_ok:
                 conv = "counter-clockwise" if cfg.HEADING_CCW_POSITIVE else "clockwise"
@@ -304,8 +382,9 @@ class Tester:
         return format_command(v, -math.radians(w_ccw))
 
     def tick(self, now, pressed):
-        if self.test is None and self.watchdog is None:
+        if self.test is None and self.watchdog is None and self.measure is None:
             self.cmd = self.manual(pressed)
+        self.step_measure(now)
         self.step_test(now)
         self.step_watchdog(now)
         if self.sending and now >= self.next_send:
@@ -380,8 +459,10 @@ def draw(win, font, big, tst, link):
         y += 6
         text("robot says: " + " | ".join(tst.robot_logs)[:110], 12, y, DIM)
 
-    help_ = ("W/S drive  A/D turn  Space stop  G grip  L leave  Z zero  "
-             "tests: 1 fwd  2 back  3 left  4 right  5 watchdog  Esc quit")
+    help_ = ("W/S drive  A/D turn  Space stop  G grip  L leave  Z zero  M measure sensors  Esc quit")
+    help2 = ("tests: 1 fwd 12in  2 back 12in  3 left 90  4 right 90  5 watchdog   "
+             "small: 6 fwd 3in  7 back 3in  8 left 15  9 right 15")
+    text(help2, 12, win.get_height() - 44, DIM)
     text(help_, 12, win.get_height() - 24, DIM)
     pygame.display.flip()
 
@@ -435,10 +516,13 @@ def main():
                     tst.result(f"sent {GRIP_OPEN} (leave behind)")
                 elif ev.key == pygame.K_z and tst.last_parsed:
                     tst.zero = tst.last_parsed[1:]
-                elif ev.key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4):
+                elif ev.key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4,
+                                pygame.K_6, pygame.K_7, pygame.K_8, pygame.K_9):
                     tst.start_test(ev.key - pygame.K_0)
                 elif ev.key == pygame.K_5:
                     tst.start_watchdog(now)
+                elif ev.key == pygame.K_m:
+                    tst.start_measure(now)
         for line in link.poll(dt, {}):              # sim ignores keys here: it obeys C lines
             tst.handle_line(line, time.time())
         tst.tick(now, pygame.key.get_pressed())

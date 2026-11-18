@@ -9,8 +9,21 @@ import math
 # --------------------------------------------------------------------------
 # Serial link
 # --------------------------------------------------------------------------
-SERIAL_PORT = "COM3"          # override with --port COM5
-SERIAL_BAUD = 115200          # override with --baud
+SERIAL_PORT = "COM18"         # the master Uno; override with --port COM5
+SERIAL_BAUD = 9600            # override with --baud. Must match Serial.begin()
+                              # in the master sketch (arduino/ folder: 9600)
+# Text to send after connecting to put the firmware into its PC-control mode.
+# The master sketch shows a menu at power-up and needs "c". Nothing else is
+# sent until the first R line arrives; the text is repeated until then.
+# Set to None for firmware that streams R lines straight away.
+SERIAL_START_COMMAND = "c"
+SERIAL_START_DELAY_S = 2.5    # wait for the Arduino to reboot after the port opens
+SERIAL_START_RETRY_S = 2.0
+# A drive command identical to the last one sent is only repeated this often
+# (a keepalive for the firmware's 0.5 s watchdog). Changes go out at once.
+# Sending every frame let lines pile up faster than the master read them, and
+# commands arrived up to 18 s late.
+SERIAL_CMD_KEEPALIVE_S = 0.2
 SERIAL_DISTANCE_UNITS = "in"  # units of odometry distance and ranges in the
                               # robot's messages: "cm", "mm" or "in"
 # Robot reports heading counter-clockwise positive (standard math / ROS
@@ -28,18 +41,21 @@ MAX_ODOM_JUMP_IN = 24.0
 #   name, mount angle (deg, clockwise from robot front: right = +90, left = -90),
 #   forward offset (in), right offset (in) of the sensor face from the robot's
 #   rotation centre, sensor type (key of SENSOR_TYPES).
-# Measure the offsets on your robot; the IR offsets below are a guess (3 in
-# out from the centre along the 45 degree line).
+# Offsets estimated from a top-down photo (6 in top plate = scale), measured
+# from the CENTRE OF THE TOP PLATE to each sonar's mesh face / IR's lens face.
+# If the wheel axle (the real turning centre) is NOT under the plate centre,
+# subtract the axle's forward offset from every forward offset below.
+# IR angle: 30 deg off straight ahead, measured on the robot.
 # The navigator looks sensors up by name: keep "front", "right", "back",
 # "left"; "front_left" / "front_right" are optional.
 # --------------------------------------------------------------------------
 SENSORS = [
-    ("front",         0.0,  3.0,  0.0,  "sonar"),
-    ("right",        90.0,  0.0,  3.0,  "sonar"),
-    ("back",        180.0, -3.0,  0.0,  "sonar"),
-    ("left",        -90.0,  0.0, -3.0,  "sonar"),
-    ("front_left",  -45.0,  2.1, -2.1,  "ir"),
-    ("front_right",  45.0,  2.1,  2.1,  "ir"),
+    ("front",         0.0,  3.0,   0.0,  "sonar"),
+    ("right",        90.0, -0.15,  3.2,  "sonar"),
+    ("back",        180.0, -3.35,  0.0,  "sonar"),
+    ("left",        -90.0, -0.15, -3.1,  "sonar"),
+    ("front_left",  -30.0,  1.7,  -1.65, "ir"),
+    ("front_right",  30.0,  1.7,   1.65, "ir"),
 ]
 
 # Per-type sensor model. Measurement likelihood = mixture of a Gaussian around
@@ -48,8 +64,9 @@ SENSORS = [
 #   beam_deg         full cone angle (the nearest surface in the cone is read)
 #   min_in / max_in  readings are clipped to this range
 #   reliable_min_in  closer than this the sensor can't be trusted. The Sharp IR
-#                    output FOLDS BACK below 10 cm (a 5 cm wall reads like
-#                    ~20 cm), so wherever the map says the IR would be closer
+#                    output FOLDS BACK below its minimum (4 cm for the
+#                    GP2Y0A41SK, 10 cm for the GP2Y0A21YK: closer walls read
+#                    farther), so wherever the map says the IR would be closer
 #                    than this, that reading is treated as uninformative, and
 #                    measured values below it are ignored.
 #   sim_*            noise used by the simulated robot only
@@ -59,9 +76,11 @@ SENSOR_TYPES = {
                   sigma_base=1.0, sigma_prop=0.04, random_prob=0.10,
                   sim_noise_in=0.5, sim_noise_prop=0.0, sim_outlier=0.03,
                   sim_folds=False),
-    # Sharp GP2Y0A21YK: 10-80 cm, narrow beam, noise grows with distance
-    "ir": dict(beam_deg=5.0, min_in=10.0 / 2.54, max_in=80.0 / 2.54,
-               reliable_min_in=10.0 / 2.54,
+    # Sharp GP2Y0A41SK0F: 4-30 cm, narrow beam, noise grows with distance.
+    # (For a GP2Y0A21YK0F use 10 / 80 / 10 cm, and CTRL_IR_MODEL 21 in the
+    # master sketch.) Readings beyond max_in count as "nothing in range".
+    "ir": dict(beam_deg=5.0, min_in=4.0 / 2.54, max_in=30.0 / 2.54,
+               reliable_min_in=4.0 / 2.54,
                sigma_base=0.5, sigma_prop=0.06, random_prob=0.05,
                sim_noise_in=0.2, sim_noise_prop=0.03, sim_outlier=0.01,
                sim_folds=True),
@@ -92,7 +111,7 @@ GRIP_REACH_IN = REAR_EDGE_IN + BLOCK_SIZE_IN / 2   # rotation centre -> centre o
 TOF_CLOSE_IN = 1.6                    # once a valid ToF reading is <= this (~4 cm)...
 GRIP_CONTACT_EXTRA_IN = 0.2           # ...back up the measured remaining gap plus this, by odometry
 GRIP_CONFIRM_MAX_IN = 2.0             # after G: ToF must read below this (or nothing) = block present
-GRIP_TIME_S = 1.0                     # wait this long after G / L for the gripper to move
+GRIP_TIME_S = 4.0                   # wait this long after G / L for the gripper to move
 BLOCK_MIN_GAP_IN = 2.0                # ToF must read this much shorter than the map's
                                       # wall distance to count as "block"
 BLOCK_SWEEP_DEG_S = 45.0              # turning speed while sweeping the ToF
@@ -165,6 +184,14 @@ SIM_ODOM_SCALE_ERR = 0.03             # systematic odometry scale error
 SIM_CMD_TIMEOUT_S = 0.5               # robot stops if no "C," command for this long
 SIM_SAFETY_STOP_IN = 2.0              # robot refuses to drive forward when its own
                                       # front sonar reads less than this
+SIM_CMD_LATENCY_S = 0.15              # (sim) delay before a command takes effect, like
+                                      # the real serial + I2C + motor spin-up delay
+# Robot body, as a circle around the turning centre: 7 in diameter (6 in plate
+# plus sensors, board corners and a little slack). Sensor positions are set
+# separately in SENSORS. Used for the path's wall margin (NAV_SAFE_MARGIN_IN),
+# the room check before pulling away from the dropped block, and counting wall
+# contacts in the simulator. Keep loose cables inside this circle!
+ROBOT_RADIUS_IN = 3.5
 
 # --------------------------------------------------------------------------
 # Autopilot / maze solving. PC -> robot command:
@@ -177,8 +204,12 @@ SIM_SAFETY_STOP_IN = 2.0              # robot refuses to drive forward when its 
 # either a pure drive (C,v,0) or a pure turn in place (C,0,w). Set True if the
 # robot can drive curves.
 ROBOT_CAN_ARC = False
-NAV_ALIGN_START_DEG = 8.0             # (no arcs) heading error above this: stop, turn in place...
-NAV_ALIGN_DONE_DEG = 3.0              # ...until it is below this, then drive straight
+NAV_ALIGN_START_DEG = 5.0             # (no arcs) heading error above this: stop, turn in place...
+NAV_ALIGN_DONE_DEG = 2.0              # ...until it is below this, then drive straight
+NAV_TURN_LEAD_S = 0.15                # (no arcs) end each turn this early (x turn rate) to allow
+                                      # for the delay before the stop takes effect: raise it if
+                                      # turns overshoot, lower it if they stop short
+NAV_TURN_SETTLE_S = 0.3               # (no arcs) hold still this long after a turn, then re-check
 NAV_CLEAR_AHEAD_IN = 3.0              # (no arcs) only drive if this much straight ahead is corridor
 NAV_TURN_MIN_DEG_S = 20.0             # slowest in-place turn sent (beat motor deadband)
 NAV_STRAIGHT_LOOKAHEAD_IN = 10.0      # (no arcs) aim at the farthest path point within
@@ -212,6 +243,14 @@ NAV_TURN_GAIN = 2.5                   # turn rate (rad/s) per rad of heading err
 NAV_TURN_IN_PLACE_DEG = 50.0          # heading error above this: stop and turn
 NAV_LOOKAHEAD_IN = 6.0                # steer toward the path point this far ahead
 NAV_EDGE_PENALTY = 2.0                # path cost near corridor edges (keeps it centred)
+NAV_SAFE_MARGIN_IN = 1.5              # straight lines must keep the robot body (ROBOT_RADIUS_IN)
+                                      # at least this far off every wall and wall corner
+# Prefer driving along the maze's axes (north/south/east/west) instead of at
+# an angle: a straight leg to the next path point becomes an L of two
+# axis-aligned legs. Sideways offsets below NAV_CARDINAL_TOL_IN are ignored
+# (no tiny sidesteps); larger ones are corrected with a short square leg.
+NAV_CARDINAL = True
+NAV_CARDINAL_TOL_IN = 1.5
 # Hysteresis on the localizer's confidence
 NAV_START_SPREAD_IN = 3.0             # start navigating below this spread...
 NAV_START_CONF = 0.7                  # ...with at least this much weight in the cluster
@@ -233,6 +272,23 @@ NAV_ARRIVE_MIN_DRIVEN_IN = 24.0       # ...and only after driving at least this 
                                       # earlier, keep wandering to confirm, then come back
 NAV_GOAL_MARGIN_IN = 2.0              # must get this far inside the goal's free area
                                       # (estimates are good to ~1-2 in)
+# Start of the run: spin this far in place (measured by odometry) before
+# driving anywhere, so all sensors sweep the walls first. 0 = no spin.
+START_SPIN_DEG = 360.0
+START_SPIN_DEG_S = 45.0               # slow enough for ~8 sensor readings per 45 deg at 10 Hz
+# Wander along the maze axes (robots that can't arc): after the start spin
+# the axis directions are known, so wandering only drives straight along an
+# axis, turns in whole 90 deg steps (measured by odometry) and keeps to the
+# middle between two walls.
+WANDER_ON_AXES = True
+WANDER_FRONT_STOP_IN = 3.75           # stop and turn when the front sonar reads this: the
+                                      # centre is then about on the crossing corridor's centre
+                                      # line (12 in corridors; allows ~0.75 in of stopping delay)
+WANDER_CORRIDOR_MAX_IN = 6.0          # both side sonars below this = between two walls
+WANDER_CENTER_TOL_IN = 0.75           # off-centre by more than this -> side-step back
+WANDER_CENTER_ANGLE_DEG = 20.0        # side-step: turn this far, drive, turn back
+WANDER_CENTER_MAX_STEP_IN = 8.0       # longest side-step leg
+WANDER_CENTER_EVERY_IN = 4.0          # drive at least this far between side-steps
 # Localize-mode wandering (uses raw sonar readings only)
 WANDER_SPEED_IN_S = 5.0
 WANDER_FRONT_CLEAR_IN = 7.0           # turn when the front reading is below this
@@ -241,10 +297,10 @@ WANDER_SIDE_MIN_IN = 1.0              # steer away from a side wall closer than 
                                       # (side sonar 3 in out: 1 in = centre 4 in from the wall)
 WANDER_ESCAPE_S = 0.6                 # (no arcs) after turning away from a wall, drive
                                       # straight this long before reacting to the sides again
-# Turn away when a 45-degree IR reads less than this AND the sonar on the same
-# side reads farther than the IR, i.e. the IR sees a corner / wall ahead rather
-# than the wall running alongside (which the side sonar always reads closer).
-# Keep it above the IR's 10 cm (3.9 in) fold-back point.
+# Turn away when a front-angled IR reads less than this AND the sonar on the
+# same side reads farther than the IR, i.e. the IR sees a corner / wall ahead
+# rather than the wall running alongside (which the side sonar reads closer).
+# Keep it above the IR's fold-back point (reliable_min_in: 4 cm = 1.6 in).
 WANDER_IR_MIN_IN = 4.5
 # Stall recovery: commanded forward but odometry isn't moving (e.g. a corner
 # clipped where no sonar points) -> back up, then turn.
@@ -253,3 +309,13 @@ STALL_MIN_PROGRESS_IN = 0.3
 RECOVER_BACKUP_S = 0.6
 RECOVER_TURN_S = 0.6
 RECOVER_SPEED_IN_S = 3.0
+RECOVER_BACKUP_IF_AHEAD_IN = 4.0      # back up only if front sonar / IR reads below this,
+                                      # otherwise just turn (the back is blind at the corners)
+# Wall guard: whatever the position estimate says, never drive forward when
+# the front sonar reads less than GUARD_FRONT_IN or a front IR less than
+# GUARD_IR_IN, and never reverse when the back sonar reads less than
+# GUARD_BACK_IN (readings = inches from the sensor face). A held-back drive
+# counts as a stall, so the robot backs off and turns toward open space.
+GUARD_FRONT_IN = 2.5
+GUARD_IR_IN = 2.5
+GUARD_BACK_IN = 1.5

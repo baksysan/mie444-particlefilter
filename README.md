@@ -8,7 +8,9 @@ to target 2, a square you choose for each run.
 Over a serial (COM) port the robot streams:
 - wheel odometry
 - 4 ultrasonic ranges (front, right, back, left)
-- 2 Sharp GP2Y0A21YK IR ranges (front-left and front-right, at 45°)
+- 2 Sharp IR ranges (front-left and front-right, 30° off straight
+  ahead). The readings match the GP2Y0A41SK0F (4–30 cm); for a GP2Y0A21YK0F
+  (10–80 cm) set `CTRL_IR_MODEL 21` in the master and its limits in `config.py`
 - the ToF range
 
 The PC sends back drive and gripper commands.
@@ -41,11 +43,28 @@ is the estimate, and orange lines are the live sensor readings drawn from it.
 | `block_task.py` | Finding the block with the ToF, backing onto it, gripping it |
 | `mcl.py` | Display and main loop |
 | `serial_tester.py` | Bench tester for the `R` / `C` / `G` / `L` serial lines (no maze needed) |
+| `arduino/` | The two Arduino sketches: master (sensors, serial) and slave (motors, encoders, gripper) |
 | `original_sim/` | The original keyboard-only simulation, kept for reference |
 
+## Arduino sketches (`arduino/`)
+- **Master** (`ArduinoSensor20261117`): the PC-control code is mode `c`
+  and the "PC CONTROL MODE" section at the bottom of the file. The Python
+  programs send `c` after connecting (`SERIAL_START_COMMAND`) and hold back
+  all other lines until the first `R` line arrives.
+- **Slave** (`ArduinoMotor20261117`): takes a 5-byte I2C drive message
+  (`'v'`, left direction, right direction, RPM ×10) and answers an I2C request
+  with 8 bytes: the signed left and right encoder totals. The PID is unchanged.
+- **Measure and set** `CTRL_WHEEL_DIAMETER_IN`, `CTRL_WHEEL_BASE_IN` and
+  `CTRL_COUNTS_PER_REV` in the master. Check them with `serial_tester.py`
+  tests 1 and 3.
+- **Rear ToF:** set `CTRL_USE_TOF` to 1 in the master once the VL53L0X is wired
+  and the Pololu `VL53L0X` library is installed. Until then the ToF field is
+  −1 and the block search cannot work.
+
 ## Serial protocol (robot → PC)
-115200 baud by default. Send one ASCII line per sample, ending in `\n`, at
-about 10–20 Hz:
+9600 baud by default (`SERIAL_BAUD`; it must match the master sketch). Send
+one ASCII line per sample, ending in `\n`, at about 10–20 Hz (10 Hz is the
+most that fits at 9600 baud):
 
 ```
 R,<odom_dist>,<odom_heading_deg>,<front>,<right>,<back>,<left>,<front_left>,<front_right>,<tof>
@@ -56,7 +75,7 @@ R,<odom_dist>,<odom_heading_deg>,<front>,<right>,<back>,<left>,<front_left>,<fro
 | `odom_dist` | **Cumulative** signed distance since boot in **inches**, forward positive, e.g. `(left_enc + right_enc) / 2` converted to inches |
 | `odom_heading_deg` | **Cumulative** heading change since boot from the encoders, `(right - left) / wheelbase`, **counter-clockwise positive** (left turn = +) |
 | `front` … `left` | Ultrasonic ranges in inches. Send `47.2` (120 cm) or more when there's no echo. Send `0` if a sensor failed and its reading must be ignored |
-| `front_left`, `front_right` | Sharp IR ranges in inches, from your voltage-to-distance conversion, sent as-is. Send `31.5` (80 cm) or more for nothing in range, and `0` for a failed sensor |
+| `front_left`, `front_right` | Sharp IR ranges in inches, from your voltage-to-distance conversion, sent as-is. Send `11.8` (30 cm) or more for nothing in range, and `0` for a failed sensor |
 | `tof` | Rear VL53L0X range in inches (the one under the back sonar; its mm output ÷ 25.4). Send `39.4` (100 cm) or more for nothing in range, and `0` for a failed or invalid reading |
 
 Example: `R,60.31,-87.5,9.49,3.27,47.24,3.11,5.59,12.20,8.86`
@@ -77,10 +96,11 @@ All distances are in inches (`SERIAL_DISTANCE_UNITS = "in"` in `config.py`;
 1. `SENSORS`: each sensor's mounting angle, its forward/right offset (in
    inches) from the robot's rotation centre (the midpoint between the drive
    wheels), and its type. The order must match the message. **Measure the IR
-   offsets:** the defaults are a guess (3 in out along the 45° line).
+   offsets:** the defaults are a guess (2.1 in forward, 2.1 in to the side;
+   the IRs point 30° off straight ahead).
 2. `SERIAL_DISTANCE_UNITS` and `HEADING_CCW_POSITIVE` if your firmware differs.
 3. `SENSOR_TYPES`: beam width, range limits and noise for each sensor type.
-   Defaults: sonar 15° cone and 2–120 cm; IR 5° beam and 10–80 cm.
+   Defaults: sonar 15° cone and 2–120 cm; IR 5° beam and 4–30 cm.
 4. `WANDER_IR_MIN_IN`: how close an IR reading can get before the robot turns
    away while wandering. It depends on the IR mounting; see the comment in
    `config.py`.
@@ -102,15 +122,15 @@ All distances are in inches (`SERIAL_DISTANCE_UNITS = "in"` in `config.py`;
 ### How the IR sensors are used
 - **Localization:** they're used like the sonars, but with a narrow beam and
   noise that grows with distance.
-- **The 10 cm problem:** the GP2Y0A21YK's output folds back below 10 cm, so a
-  wall at 5 cm reads like about 20 cm. The filter handles this on both sides:
-  - Measured IR values under 10 cm are ignored.
-  - Wherever a particle would put the IR closer than 10 cm, that reading counts
-    as no evidence for or against it. A folded reading therefore can't push the
-    filter toward the wrong place.
-
-  In a 12 in corridor this matters: a centred robot's IRs read about 14 cm, and
-  1 in off-centre is already about 10 cm.
+- **The fold-back problem:** a Sharp IR's output folds back below its minimum
+  range (4 cm for the GP2Y0A41SK), so a wall closer than that reads farther
+  away. The filter handles this on both sides:
+  - Measured IR values under the minimum (`reliable_min_in`) are ignored.
+  - Wherever a particle would put the IR closer than the minimum, that reading
+    counts as no evidence for or against it. A folded reading therefore can't
+    push the filter toward the wrong place.
+- **Short range:** the GP2Y0A41SK only reaches 30 cm (11.8 in). Anything
+  farther reads as "nothing in range", which the filter also uses.
 - **Corner avoidance:** while wandering, the robot turns away from a side when
   that side's IR reads under `WANDER_IR_MIN_IN` **and** the same side's sonar
   reads farther than the IR.
@@ -295,10 +315,13 @@ quitting does **not** open the gripper, so a held block stays held.
 3. Hold those wheel speeds with a PID loop on the encoders.
 4. **Stop if no `C,` line has arrived for about 0.5 s** (PC crash, unplugged
    cable).
-5. **Refuse to drive forward when the front sonar reads under about 2 in.**
-   Don't apply this to reversing: the robot backs onto the block on purpose.
+5. **Refuse to drive forward when the front sonar reads under about 2 in,
+   and to reverse when the back sonar reads under about 1 in.** The back sonar
+   sits above the block, so it only sees walls and backing onto the block
+   still works. (The PC applies its own, larger margins too: `GUARD_*` in
+   `config.py`.)
 6. On `G` close the gripper, and on `L` open it. The PC waits
-   `GRIP_TIME_S` (1 s) before moving on, so the gripper must finish within
+   `GRIP_TIME_S` (4 s; the slave's down / close / up sequence takes about 3 s) before moving on, so the gripper must finish within
    that time.
 7. Keep streaming `R,` lines the whole time, including the ToF field.
 
@@ -340,11 +363,34 @@ to fix.
 | 1 / 2 | Drive forward / backward for 12 in (speed × time) | Odometry counts the right way and the right amount. Measure the robot too: if both disagree with 12 in, the speed control is off. If only the odometry disagrees, fix the wheel size or encoder counts |
 | 3 / 4 | Turn left / right 90° | The heading sign (left turn = + with `HEADING_CCW_POSITIVE = True`) and its scale. Watch that the robot really turned 90° the right way |
 | 5 | Watchdog | Drives 1 s, then sends **nothing** for 2.5 s. The robot must stop by itself within about 0.5 s. FAIL means the firmware has no command timeout |
+| 6 / 7 | Small step forward / backward 3 in, at half speed | Odometry on short moves. Mark the floor and compare the real distance with the odometry the result prints; short moves come up a little short while the wheels speed up, so ±30% passes |
+| 8 / 9 | Small turn left / right 15°, at half turn rate | Heading on small turns, the same way |
+| M | Measure sensors | Hold still 3 s, then each sensor's average, noise (standard deviation), min..max, spikes (readings over 3 in from the typical value) and invalid readings. Compare the averages with a tape measure from each sensor. Also reports if the odometry changed while the robot stood still |
 
 `--log file.csv` records every line sent and received, with timestamps, for
 debugging.
 
 ## Notes
+- **Start of a run:** the robot first spins 360° in place (`START_SPIN_DEG`),
+  so every sensor sweeps the walls. From that, it works out which odometry
+  headings line up with the maze's axes: from the localizer if it's already
+  confident, otherwise from where the opposite sonars read shortest. While
+  localizing, it then wanders only along those axes (`WANDER_ON_AXES`): it
+  turns in whole 90° steps measured by odometry, stops for a wall ahead about
+  on the crossing corridor's centre line (`WANDER_FRONT_STOP_IN`), and keeps
+  to the middle between two walls with short 20° side-steps
+  (`WANDER_CENTER_*`). When navigating, turns are also measured by odometry
+  and stop `NAV_TURN_LEAD_S` early to allow for the command delay.
+- **Avoiding wall contact:** the PC never drives forward when the front sonar
+  reads under `GUARD_FRONT_IN` or a front IR under `GUARD_IR_IN`, and never
+  reverses when the back sonar reads under `GUARD_BACK_IN`, whatever the
+  position estimate says (the status bar shows "wall guard: ..."). A held-back
+  drive counts as a stall: the robot backs off (only if something is close
+  ahead) and turns toward open space. After dropping the block it only pulls
+  forward if the map shows room. The sensors can't see the diagonals
+  (between the 30° IRs and the side sonars, and behind the side sonars), so keep
+  cables and anything else inside the 6 in plate: `ROBOT_RADIUS_IN` (3.4 in)
+  is the body size the simulator counts contacts with.
 - The maze has look-alike spots. From some starting positions the filter needs
   some driving before it can tell them apart, and it may briefly lock onto the
   wrong one. Random particles are injected automatically when the readings stop

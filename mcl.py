@@ -104,6 +104,8 @@ def main():
     ap.add_argument("--list-ports", action="store_true")
     ap.add_argument("--target2", metavar="X,Y",
                     help="centre of target 2 in inches (or right-click in the window)")
+    ap.add_argument("--no-block", action="store_true",
+                    help="skip the block this run: drive to target 1, then straight on to target 2")
     args = ap.parse_args()
 
     if args.list_ports:
@@ -118,7 +120,10 @@ def main():
     loc = Localizer(pf)
     link = SimulatedRobot(grid, model) if args.sim else SerialRobot(args.port, args.baud)
     tof_model = maze.RangeModel(grid, [cfg.TOF_SENSOR])
-    nav = Navigator(grid, tof_model)
+    # without a ToF model the navigator skips the block step entirely
+    nav = Navigator(grid, None if args.no_block else tof_model)
+    if args.no_block:
+        print("No block this run: target 1, then target 2.")
     if args.target2:
         try:
             tx, ty = (float(v) for v in args.target2.split(","))

@@ -28,6 +28,7 @@ PC -> robot:
 import math
 import queue
 import threading
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -94,34 +95,113 @@ def parse_command(line):
 
 
 class SerialRobot:
-    """Reads lines from a COM port on a background thread."""
+    """Talks to a COM port from ONE background thread that takes turns:
+    write what is waiting, then read what has arrived, then pause 5 ms.
+
+    No read is ever left waiting on the port. Some USB-serial drivers (common
+    on Arduino clones) hold back writes while a read is pending, which made
+    commands go out many seconds late or not at all.
+
+    Writing never blocks the caller. If the port stops accepting data for a
+    while, the GUI keeps running, and only the NEWEST drive command is kept
+    waiting: older C lines are thrown away instead of piling up and being
+    replayed late. Other lines (G, L, ...) are kept and sent in order."""
+
+    WRITE_TIMEOUT_S = 1.0
 
     def __init__(self, port, baud):
         import serial  # pyserial
         # serial_for_url accepts "COM5" as well as test URLs like "loop://"
-        self.serial = serial.serial_for_url(port, baudrate=baud, timeout=0.1)
+        # timeout=0: reads return at once with whatever has arrived
+        self.serial = serial.serial_for_url(port, baudrate=baud, timeout=0,
+                                            write_timeout=self.WRITE_TIMEOUT_S,
+                                            rtscts=False, dsrdtr=False, xonxoff=False)
         self.name = f"{port} @ {baud}"
         self.manual = False   # no keyboard driving for the real robot
         self.lines = queue.Queue()
         self.error = None
+        self.write_stalls = 0     # writes the port didn't accept within WRITE_TIMEOUT_S
+        self.dropped_cmds = 0     # stale C lines replaced by a newer one before going out
+        # Firmware with a start-up menu: send SERIAL_START_COMMAND until R
+        # lines arrive, and hold back everything else until then.
+        self.start_command = cfg.SERIAL_START_COMMAND
+        self.started = not self.start_command
+        self._next_start = time.time() + cfg.SERIAL_START_DELAY_S
+        self._last_cmd, self._last_cmd_t = None, 0.0
+        self._out = []                       # bytes waiting to be written, in order
+        self._out_lock = threading.Lock()
+        self._out_ready = threading.Event()
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread = threading.Thread(target=self._io, daemon=True)
         self._thread.start()
 
-    def _reader(self):
-        buf = b""
-        while not self._stop.is_set():
+    def _queue(self, data):
+        with self._out_lock:
+            if data.startswith(b"C,"):
+                before = len(self._out)
+                self._out = [d for d in self._out if not d.startswith(b"C,")]
+                self.dropped_cmds += before - len(self._out)
+            self._out.append(data)
+        self._out_ready.set()
+
+    def _write_batch(self):
+        """Write everything waiting. Returns False if the port failed."""
+        import serial
+        with self._out_lock:
+            batch, self._out = self._out, []
+            self._out_ready.clear()
+        for data in batch:
+            t0 = time.time()
             try:
-                chunk = self.serial.read(self.serial.in_waiting or 1)
+                self.serial.write(data)
+            except serial.SerialTimeoutException:
+                self.write_stalls += 1
+                print(f"[serial] the port did not accept data for {self.WRITE_TIMEOUT_S:.0f} s "
+                      f"(stall #{self.write_stalls}) - dropped {data!r}")
+                try:
+                    self.serial.reset_output_buffer()   # don't let stale commands go out later
+                except Exception:
+                    pass
+            except Exception as e:
+                self.error = str(e)
+                return False
+            else:
+                if time.time() - t0 > 0.3:
+                    print(f"[serial] slow write: {time.time() - t0:.2f} s for {data!r}")
+        return True
+
+    def _io(self):
+        buf = b""
+        while True:
+            if not self._write_batch():
+                return
+            if self._stop.is_set():
+                self._write_batch()                  # anything queued just before close()
+                return
+            try:
+                n = self.serial.in_waiting
+                chunk = self.serial.read(n) if n else b""
             except Exception as e:  # unplugged, etc.
                 self.error = str(e)
                 return
+            if not chunk:
+                self._out_ready.wait(0.005)          # idle: wake early if something is to be sent
+                continue
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
-                self.lines.put(line.decode("ascii", errors="ignore").strip())
+                text = line.decode("ascii", errors="ignore")
+                # keep printable characters only: an Arduino resetting can send
+                # NUL bytes, which crash pygame's text drawing
+                text = "".join(ch for ch in text if " " <= ch <= "~").strip()
+                if text.startswith("R,"):
+                    self.started = True
+                self.lines.put(text)
 
     def poll(self, dt=None, keys=None):
+        if not self.started and time.time() >= self._next_start:
+            self._next_start = time.time() + cfg.SERIAL_START_RETRY_S
+            self._queue(self.start_command.encode("ascii"))       # no newline
         out = []
         while True:
             try:
@@ -130,19 +210,24 @@ class SerialRobot:
                 return out
 
     def send(self, text):
-        try:
-            self.serial.write((text + "\n").encode("ascii"))
-        except Exception as e:
-            self.error = str(e)
+        if not self.started:
+            return      # the firmware is still in its menu: it would misread this
+        if text.startswith("C,"):
+            now = time.time()
+            if text == self._last_cmd and now - self._last_cmd_t < cfg.SERIAL_CMD_KEEPALIVE_S:
+                return  # unchanged: only a keepalive now and then
+            self._last_cmd, self._last_cmd_t = text, now
+        self._queue((text + "\n").encode("ascii"))
 
     def close(self):
+        # give the final stop command up to ~1.5 s to go out, never hang
         self._stop.set()
-        self._thread.join(timeout=1)
+        self._out_ready.set()
+        self._thread.join(timeout=self.WRITE_TIMEOUT_S + 0.5)
         try:
-            self.serial.flush()  # make sure a final stop command goes out
+            self.serial.close()
         except Exception:
             pass
-        self.serial.close()
 
 
 class SimulatedRobot:
@@ -185,6 +270,21 @@ class SimulatedRobot:
         self.block_y = float(self.rng.uniform(y0 + 0.5, y1 - 0.5))
         self.held = False
         self.block_bumps = 0     # frames the body overlapped the loose block (for testing)
+        # wall contact accounting: body = circle of ROBOT_RADIUS_IN
+        wy, wx = np.nonzero(grid == maze.WALL)
+        self._wall_x, self._wall_y = wx.astype(float), wy.astype(float)
+        self.wall_contacts = 0   # separate touches of a wall (for testing)
+        self.contact_time = 0.0  # seconds spent touching a wall
+        self.min_clearance = math.inf
+        self._touching = False
+        self.time = 0.0
+        self._pending = []       # (time it takes effect, (v, w)) - command latency
+        # start like a real run: placed by hand, not touching a wall
+        for _ in range(200):
+            if self.wall_clearance() >= 0.5:
+                break
+            c = cells[self.rng.integers(len(cells))]
+            self.x, self.y = c[0] + 0.5, c[1] + 0.5
 
     def place_block(self, x, y):
         self.block_x, self.block_y, self.held = float(x), float(y), False
@@ -228,6 +328,22 @@ class SimulatedRobot:
             self.block_x += (self.reach - along) * bx
             self.block_y += (self.reach - along) * by
 
+    def wall_clearance(self):
+        """Gap (inches) between the body circle and the nearest wall; < 0 = touching."""
+        dx = np.maximum(np.maximum(self._wall_x - self.x, self.x - (self._wall_x + 1)), 0.0)
+        dy = np.maximum(np.maximum(self._wall_y - self.y, self.y - (self._wall_y + 1)), 0.0)
+        return float(np.sqrt((dx * dx + dy * dy).min())) - cfg.ROBOT_RADIUS_IN
+
+    def _count_contact(self, dt):
+        c = self.wall_clearance()
+        self.min_clearance = min(self.min_clearance, c)
+        touching = c < 0
+        if touching:
+            self.contact_time += dt
+            if not self._touching:
+                self.wall_contacts += 1
+        self._touching = touching
+
     def drive(self, v, w, dt):
         """v: in/s forward, w: rad/s clockwise."""
         d = v * dt
@@ -270,6 +386,9 @@ class SimulatedRobot:
         return "R," + ",".join(f"{f:.2f}" for f in fields)
 
     def poll(self, dt, keys):
+        self.time += dt
+        while self._pending and self._pending[0][0] <= self.time:
+            self.cmd, self.cmd_age = self._pending.pop(0)[1], 0.0
         self.cmd_age += dt
         self.manual = any(keys.get(k, 0) for k in "wasd")
         if self.manual:
@@ -290,6 +409,7 @@ class SimulatedRobot:
             if front < cfg.SIM_SAFETY_STOP_IN:
                 v = 0.0
         self.drive(v, w, dt)
+        self._count_contact(dt)
         self.t_accum += dt
         out = []
         period = 1.0 / cfg.SIM_RATE_HZ
@@ -301,7 +421,8 @@ class SimulatedRobot:
     def send(self, text):
         cmd = parse_command(text)
         if cmd is not None:
-            self.cmd, self.cmd_age = cmd, 0.0
+            # takes effect after SIM_CMD_LATENCY_S, like the real link + motors
+            self._pending.append((self.time + cfg.SIM_CMD_LATENCY_S, cmd))
         elif text.strip() == GRIP_CLOSE:
             gx, gy = self._grip_point()
             if math.hypot(gx - self.block_x, gy - self.block_y) <= cfg.SIM_GRIP_CAPTURE_IN:

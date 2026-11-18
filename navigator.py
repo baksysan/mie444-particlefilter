@@ -35,6 +35,28 @@ def clearance_map(grid):
     return _distance_from(grid != maze.FREE)
 
 
+def wall_distance_map(grid):
+    """Euclidean distance (inches) from each cell's centre to the nearest WALL."""
+    wy, wx = np.nonzero(grid == maze.WALL)
+    h, w = grid.shape
+    cy, cx = np.mgrid[0:h, 0:w]
+    px, py = cx.ravel() + 0.5, cy.ravel() + 0.5
+    best = np.full(px.shape, np.inf)
+    for i in range(0, len(wx), 256):                       # chunks keep memory small
+        bx, by = wx[i:i + 256, None].astype(float), wy[i:i + 256, None].astype(float)
+        dx = np.maximum(np.maximum(bx - px, px - (bx + 1)), 0.0)
+        dy = np.maximum(np.maximum(by - py, py - (by + 1)), 0.0)
+        best = np.minimum(best, np.sqrt(dx * dx + dy * dy).min(axis=0))
+    return best.reshape(h, w)
+
+
+def safe_map(grid):
+    """Cells where the robot's centre keeps its whole body (ROBOT_RADIUS_IN)
+    at least NAV_SAFE_MARGIN_IN off every wall. Straight lines, the staging
+    point for the block and the drop pose must stay on these cells."""
+    return (grid == maze.FREE) & (wall_distance_map(grid) >= cfg.ROBOT_RADIUS_IN + cfg.NAV_SAFE_MARGIN_IN)
+
+
 def goal_mask(grid, goal, margin_in):
     """FREE cells of the goal rectangle at least margin_in from its edge (falls
     back to the whole free part of the rectangle if it is too small)."""
@@ -145,7 +167,7 @@ def plan_drop(grid, rect, x, y, safe=None):
     turns to heading phi (back toward D) and opens the gripper."""
     reach = cfg.GRIP_REACH_IN
     if safe is None:
-        safe = clearance_map(grid) >= 2   # robot positions ~1 in inside the corridor
+        safe = safe_map(grid)
     x0, x1, y0, y1 = rect
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
     m = cfg.BLOCK_SIZE_IN                 # keep the whole block inside the square
@@ -189,12 +211,14 @@ class Navigator:
         self.holding = False
         self.outbox = []           # commands for the robot (gripper), sent by mcl.py
         self.release_time = 0.0
+        self.release_clear = True  # room to pull away after letting go of the block
         self.drop = None           # (robot pos, heading, drop spot) for target 2
         self.drop_state = "goto"
         self.drop_timer = 0.0
         # Straight-line moves must stay ~1 in inside the corridor, so a small
         # estimate error doesn't clip an inside corner.
-        self.safe = clearance_map(grid) >= 2
+        self.wall_dist = wall_distance_map(grid)
+        self.safe = (grid == maze.FREE) & (self.wall_dist >= cfg.ROBOT_RADIUS_IN + cfg.NAV_SAFE_MARGIN_IN)
         self.free = maze.free_cells(grid)
         self.mode = LOCALIZE
         self.good_time = 0.0
@@ -209,7 +233,19 @@ class Navigator:
         self.stall_time = 0.0
         self.recover_time = 0.0
         self.stalls = 0
+        self.guarded = None        # why the wall guard last held back a drive (or None)
         self.aligning = False      # no-arc mode: currently turning in place
+        self.turn_goal = None      # no-arc mode: odometry heading the current turn ends at
+        self.start_spin_done = cfg.START_SPIN_DEG <= 0   # 360 deg spin at the start of the run
+        self.spin_turned, self.spin_last = 0.0, None
+        self.spin_samples = []     # (odometry heading, sensor readings) during the start spin
+        self.axis = None           # odometry heading of a maze axis, mod 90 deg
+        self.w_first = None        # first wander heading, picked from the start spin
+        self.w_heading = None      # wander: current axis heading (odometry frame)
+        self.w_state, self.w_next, self.w_goal = "drive", "drive", None
+        self.w_timer, self.w_dist, self.w_start, self.w_last_fix = 0.0, 0.0, None, None
+        self.settle_time = 0.0     # no-arc mode: hold still this long after a turn
+        self._dt = 0.0
         self.side_turn_time = 0.0  # no-arc wander: timed turn away from a side wall
         self.escape_time = 0.0     # no-arc wander: drive straight after that turn
         self.travel = 0.0          # inches driven (+ turning credit) since (re)starting localization
@@ -231,7 +267,7 @@ class Navigator:
         self.avoid_zone = None
         self.goal, self.goal_cells, self.dist = g.rect, g.cells, g.dist
         self.best_dist, self.no_progress_time, self.arrive_time = math.inf, 0.0, 0.0
-        self.aligning = False
+        self.aligning, self.turn_goal, self.settle_time = False, None, 0.0
 
     def set_point_goal(self, x, y, avoid=None):
         """Drive to the 1 in cell containing (x, y) (used by the block task).
@@ -287,7 +323,8 @@ class Navigator:
         self.mode = LOCALIZE
         self.good_time = self.arrive_time = self.no_progress_time = 0.0
         self.best_dist = math.inf
-        self.aligning = False
+        self.aligning, self.turn_goal, self.settle_time = False, None, 0.0
+        self.w_heading, self.w_state = None, "drive"     # wander starts afresh on an axis
         self.side_turn_time = 0.0
         self.escape_time = 0.0
         self.travel = 0.0
@@ -351,6 +388,19 @@ class Navigator:
         first = int(np.argmax(free))
         return bool(free[first:].all())
 
+    def _body_clear(self, x, y, theta, dist):
+        """Would the robot body (ROBOT_RADIUS_IN + 0.5 in) stay off the walls
+        driving `dist` inches straight from (x, y) along theta (negative = back)?"""
+        h, w = self.grid.shape
+        for t in np.linspace(0.0, 1.0, max(2, int(abs(dist) / 0.25) + 1)):
+            px, py = x + t * dist * math.cos(theta), y + t * dist * math.sin(theta)
+            cx, cy = int(math.floor(px)), int(math.floor(py))
+            if not (0 <= cy < h and 0 <= cx < w):
+                return False
+            if self.wall_dist[cy, cx] < cfg.ROBOT_RADIUS_IN + 0.5:
+                return False
+        return True
+
     def _straight_target(self, x, y):
         """Farthest path point within NAV_STRAIGHT_LOOKAHEAD_IN that can be
         reached in a straight line, so straight driving never cuts a corner.
@@ -365,7 +415,30 @@ class Navigator:
             if travelled > cfg.NAV_STRAIGHT_LOOKAHEAD_IN or not self._line_clear(x, y, qx, qy):
                 break
             best = (qx, qy)
+        if cfg.NAV_CARDINAL:
+            return self._cardinal_leg(x, y, *best)
         return best
+
+    def _cardinal_leg(self, x, y, tx, ty):
+        """Turn a straight leg to (tx, ty) into axis-aligned driving.
+        - Sideways offset within NAV_CARDINAL_TOL_IN: drive purely along the
+          main axis (the small offset is simply kept).
+        - Otherwise an L: the main axis first, then the other one (or the other
+          way round if that corner isn't clear). Replanning every step then
+          takes the second leg by itself.
+        - Falls back to the diagonal when neither L is clear."""
+        dx, dy = tx - x, ty - y
+        if math.hypot(dx, dy) < 1.0:
+            return tx, ty
+        x_main = abs(dx) >= abs(dy)
+        minor = abs(dy) if x_main else abs(dx)
+        if minor <= cfg.NAV_CARDINAL_TOL_IN:
+            return (tx, y) if x_main else (x, ty)
+        first, second = ((tx, y), (x, ty)) if x_main else ((x, ty), (tx, y))
+        for cx, cy in (first, second):
+            if self._line_clear(x, y, cx, cy) and self._line_clear(cx, cy, tx, ty):
+                return cx, cy
+        return tx, ty
 
     # ------------------------------------------------------------- behaviour
     def _reading(self, ranges, name):
@@ -398,6 +471,8 @@ class Navigator:
         corner = self._corner_close(ranges)
         w_max = math.radians(cfg.NAV_TURN_MAX_DEG_S)
         if not cfg.ROBOT_CAN_ARC:
+            if cfg.WANDER_ON_AXES and self.axis is not None and self.last_heading is not None:
+                return self._wander_axes(front, right, left, corner, dt)
             return self._wander_no_arc(front, right, left, corner, dt)
         if corner and front > cfg.WANDER_FRONT_CLEAR_IN:
             # wall corner ahead-left/right that the sonars can't see: veer away
@@ -416,6 +491,170 @@ class Navigator:
             return cfg.WANDER_SPEED_IN_S, w
         # blocked: turn in place toward the more open side (latched until clear)
         return 0.0, self.wander_dir * 0.7 * w_max
+
+    # ---------------------------------------------------- wander along the axes
+    def _snap(self, h):
+        """Odometry heading -> the nearest maze axis direction (odometry frame)."""
+        q = math.pi / 2
+        return self.axis + round((h - self.axis) / q) * q
+
+    def _w_turn_to(self, goal, then):
+        self.w_goal, self.w_next, self.w_state = goal, then, "turn"
+        return 0.0, 0.0
+
+    def _side_gap(self, left, right):
+        """How far the robot's centre is right of the corridor centre line
+        (inches, + = right of centre), from the two side sonars; None if
+        the robot isn't between two walls."""
+        if left > cfg.WANDER_CORRIDOR_MAX_IN or right > cfg.WANDER_CORRIDOR_MAX_IN:
+            return None
+        lo = abs(dict((s[0], s[3]) for s in cfg.SENSORS).get("left", 0.0))
+        ro = abs(dict((s[0], s[3]) for s in cfg.SENSORS).get("right", 0.0))
+        # distance from the centre to each wall; centred when they're equal
+        return ((left + lo) - (right + ro)) / 2
+
+    def _wander_axes(self, front, right, left, corner, dt):
+        """Wander for a robot that can't arc, once the maze's axis directions
+        are known (from the start spin, refined by the localizer):
+        - only ever drive along an axis; every turn is a whole number of 90 deg,
+          measured with the odometry
+        - at a wall ahead, stop about where the crossing corridor's centre line
+          is, then turn 90 deg toward the more open side (180 at a dead end)
+        - between two walls, keep to the centre: if off by more than
+          WANDER_CENTER_TOL_IN, side-step with a short angled leg"""
+        oh = self.last_heading
+        w_max = math.radians(cfg.NAV_TURN_MAX_DEG_S)
+        w_min = math.radians(cfg.NAV_TURN_MIN_DEG_S)
+        if self.w_heading is None:
+            self.w_heading = self._snap(oh)
+            if self.w_first is not None:                 # chosen from the start spin
+                self.w_heading, self.w_first = self.w_first, None
+            return self._w_turn_to(self.w_heading, "drive")
+
+        if self.w_state == "turn":
+            rem = wrap_angle(self.w_goal - oh)
+            rate = float(np.clip(cfg.NAV_TURN_GAIN * abs(rem), w_min, w_max))
+            if abs(rem) <= rate * cfg.NAV_TURN_LEAD_S:
+                self.w_state, self.w_timer = "settle", cfg.NAV_TURN_SETTLE_S
+                return 0.0, 0.0
+            return 0.0, math.copysign(rate, rem)
+        if self.w_state == "settle":
+            self.w_timer -= dt
+            if self.w_timer > 0:
+                return 0.0, 0.0
+            self.w_state = self.w_next
+            self.w_start = self.last_odom
+
+        if self.w_state == "sidestep":
+            done = self.last_odom is None or self.w_start is None or \
+                abs(self.last_odom - self.w_start) >= self.w_dist
+            if done or front <= cfg.WANDER_FRONT_STOP_IN:
+                self.w_last_fix = self.last_odom
+                return self._w_turn_to(self.w_heading, "drive")
+            return cfg.WANDER_SPEED_IN_S, 0.0
+
+        # ---- driving along self.w_heading
+        self.w_heading = self._snap(self.w_heading)      # follows refinements of the axis
+        if front <= cfg.WANDER_FRONT_STOP_IN or corner:
+            # wall (or a wall corner the IR sees) ahead: turn 90 deg toward the
+            # more open side; both sides closed = dead end: turn around
+            q = math.pi / 2
+            if corner:
+                turn = -corner * q                       # away from the corner
+            elif max(left, right) < cfg.WANDER_CORRIDOR_MAX_IN:
+                turn = 2 * q
+            else:
+                turn = q if right >= left else -q        # + = clockwise = right
+            self.w_heading = self._snap(self.w_heading + turn)
+            return self._w_turn_to(self.w_heading, "drive")
+        # heading drifted off the axis (e.g. the axis estimate was refined)
+        if abs(wrap_angle(self.w_heading - oh)) > max(math.radians(cfg.NAV_ALIGN_START_DEG),
+                                                      w_min * cfg.NAV_TURN_LEAD_S + math.radians(1)):
+            return self._w_turn_to(self.w_heading, "drive")
+        # keep to the middle between the walls
+        gap = self._side_gap(left, right)
+        if gap is None:
+            # one wall only: keep at least WANDER_SIDE_MIN_IN from it
+            if left < cfg.WANDER_SIDE_MIN_IN:
+                gap = -(cfg.WANDER_SIDE_MIN_IN + 1.0 - left)
+            elif right < cfg.WANDER_SIDE_MIN_IN:
+                gap = cfg.WANDER_SIDE_MIN_IN + 1.0 - right
+        recent = (self.w_last_fix is not None and self.last_odom is not None
+                  and abs(self.last_odom - self.w_last_fix) < cfg.WANDER_CENTER_EVERY_IN)
+        if gap is not None and abs(gap) > cfg.WANDER_CENTER_TOL_IN and not recent:
+            a = math.radians(cfg.WANDER_CENTER_ANGLE_DEG)
+            side = -1 if gap > 0 else 1                  # right of centre -> step left (-)
+            self.w_dist = min(abs(gap) / math.sin(a), cfg.WANDER_CENTER_MAX_STEP_IN)
+            return self._w_turn_to(self.w_heading + side * a, "sidestep")
+        return cfg.WANDER_SPEED_IN_S, 0.0
+
+    def _set_axis_after_spin(self, theta, spread, conf):
+        """End of the start spin: find the maze axes in the odometry frame.
+        Best source: the localizer, if it's already confident (the axes are at
+        estimate headings 0/90/180/270; that holds even for a look-alike lock).
+        Otherwise the spin readings. Then pick the first wander direction: the
+        axis direction that looked most open during the spin."""
+        q = math.pi / 2
+        if (self.last_heading is not None and spread < cfg.NAV_START_SPREAD_IN
+                and conf >= cfg.NAV_START_CONF):
+            self.axis = (self.last_heading - theta) % q
+        else:
+            self.axis = self._axis_from_spin()
+        if self.axis is not None:
+            self.w_first = self._most_open_axis_heading()
+
+    def _most_open_axis_heading(self):
+        idx = self.sensor_idx.get("front")
+        if idx is None or not self.spin_samples:
+            return None
+        h = np.array([s[0] for s in self.spin_samples])
+        f = np.array([s[1][idx] for s in self.spin_samples])
+        f = np.where(np.isfinite(f), f, 0.0)
+        best_front, first = -1.0, None
+        for k in range(4):
+            d = self.axis + k * math.pi / 2
+            near = np.abs((h - d + math.pi) % (2 * math.pi) - math.pi) <= math.radians(10)
+            if near.any() and float(np.median(f[near])) > best_front:
+                best_front, first = float(np.median(f[near])), d
+        return first
+
+    def _axis_from_spin(self):
+        """Maze axis direction (odometry frame, mod 90 deg) from the start spin:
+        opposite sonars (front+back, left+right) read shortest when they point
+        straight at the walls. The 15 deg sonar cone makes that minimum a
+        flat bottom, so take the centre of the lowest +-8 deg window. (Only a
+        fallback: the minimum is shallow, so this is good to ~10-15 deg.)"""
+        if len(self.spin_samples) < 12:
+            return None
+        h = np.array([s[0] for s in self.spin_samples])
+        r = np.array([s[1] for s in self.spin_samples])
+        idx = self.sensor_idx
+        if not all(k in idx for k in ("front", "back", "left", "right")):
+            return None
+        r = np.where(np.isfinite(r), r, 60.0)
+        pair = np.minimum(r[:, idx["front"]] + r[:, idx["back"]], r[:, idx["left"]] + r[:, idx["right"]])
+        best, best_a = math.inf, None
+        for deg in range(90):
+            a = math.radians(deg)
+            near = np.abs((h - a + math.pi / 4) % (math.pi / 2) - math.pi / 4) <= math.radians(8)
+            if near.sum() >= 2 and pair[near].mean() < best:
+                best, best_a = pair[near].mean(), a
+        return best_a
+
+    def _update_axis(self, theta, spread, conf):
+        """Refine the axis from the localizer: the maze axes are at estimate
+        headings of 0/90/180/270, so (odometry heading - estimate heading)
+        mod 90 deg is the axis. Holds even if the lock is a look-alike spot."""
+        if self.last_heading is None or spread >= cfg.NAV_START_SPREAD_IN or conf < cfg.NAV_START_CONF:
+            return
+        q = math.pi / 2
+        a = self.last_heading - theta
+        if self.axis is None:
+            self.axis = a % q
+            return
+        d = (a - self.axis + q / 2) % q - q / 2
+        # big disagreement = the spin fallback was off: jump; small = smooth out noise
+        self.axis = (self.axis + (1.0 if abs(d) > math.radians(6) else 0.05) * d) % q
 
     def _wander_no_arc(self, front, right, left, corner, dt):
         """Wander for a robot that can only drive straight or turn in place."""
@@ -461,30 +700,57 @@ class Navigator:
         err = wrap_angle(math.atan2(ty - y, tx - x) - theta)
         w_max = math.radians(cfg.NAV_TURN_MAX_DEG_S)
         if not cfg.ROBOT_CAN_ARC:
-            # Turn in place until facing the target, then drive straight at it.
-            # Two thresholds (start/done) stop it flickering between the two.
-            if self.aligning and abs(err) < math.radians(cfg.NAV_ALIGN_DONE_DEG):
-                self.aligning = False
-            elif not self.aligning and abs(err) > math.radians(cfg.NAV_ALIGN_START_DEG):
-                self.aligning = True
-            if not self.aligning:
-                # about to drive straight: make sure the current heading doesn't
-                # run into a wall within the next few inches
-                ax = x + cfg.NAV_CLEAR_AHEAD_IN * math.cos(theta)
-                ay = y + cfg.NAV_CLEAR_AHEAD_IN * math.sin(theta)
-                if not self._line_clear(x, y, ax, ay) and abs(err) > math.radians(cfg.NAV_ALIGN_DONE_DEG):
-                    self.aligning = True
-            if self.aligning:
-                rate = float(np.clip(cfg.NAV_TURN_GAIN * abs(err),
-                                     math.radians(cfg.NAV_TURN_MIN_DEG_S), w_max))
-                return 0.0, math.copysign(rate, err)
-            return cfg.NAV_SPEED_IN_S, 0.0
+            return self._follow_no_arc(x, y, theta, err)
         w = float(np.clip(cfg.NAV_TURN_GAIN * err, -w_max, w_max))
         if abs(err) > math.radians(cfg.NAV_TURN_IN_PLACE_DEG):
             v = 0.0
         else:
             v = cfg.NAV_SPEED_IN_S * math.cos(err) ** 2
         return v, w
+
+    def _follow_no_arc(self, x, y, theta, err):
+        """Turn in place until facing the target, then drive straight at it.
+
+        A turn is measured with the ODOMETRY, not the position estimate: when a
+        turn starts, the needed angle is taken from the estimate once, and the
+        robot turns until the encoders say it has turned that far. That is
+        steadier than chasing the estimate, which jumps a little with every
+        sensor update. The turn is ended NAV_TURN_LEAD_S early to allow for the
+        delay before a stop command takes effect, then the robot holds still
+        for NAV_TURN_SETTLE_S and checks the heading again."""
+        w_max = math.radians(cfg.NAV_TURN_MAX_DEG_S)
+        w_min = math.radians(cfg.NAV_TURN_MIN_DEG_S)
+        # the smallest turn the robot can make: even the slowest turn keeps
+        # going for NAV_TURN_LEAD_S after the stop is sent
+        smallest = w_min * cfg.NAV_TURN_LEAD_S + math.radians(1.0)
+        odom_h = self.last_heading
+        if self.settle_time > 0:                       # just finished a turn: let it stop
+            self.settle_time -= self._dt
+            return 0.0, 0.0
+        if self.aligning:
+            if odom_h is None or self.turn_goal is None:
+                remaining = err                        # no odometry: fall back to the estimate
+            else:
+                remaining = wrap_angle(self.turn_goal - odom_h)
+            rate = float(np.clip(cfg.NAV_TURN_GAIN * abs(remaining), w_min, w_max))
+            if abs(remaining) <= rate * cfg.NAV_TURN_LEAD_S:
+                # stop now: the delay carries it the rest of the way
+                self.aligning, self.turn_goal = False, None
+                self.settle_time = cfg.NAV_TURN_SETTLE_S
+                return 0.0, 0.0
+            return 0.0, math.copysign(rate, remaining)
+        start = abs(err) > max(math.radians(cfg.NAV_ALIGN_START_DEG), smallest)
+        if not start and abs(err) > smallest:
+            # about to drive straight: make sure the current heading doesn't
+            # run into a wall within the next few inches
+            ax = x + cfg.NAV_CLEAR_AHEAD_IN * math.cos(theta)
+            ay = y + cfg.NAV_CLEAR_AHEAD_IN * math.sin(theta)
+            start = not self._line_clear(x, y, ax, ay)
+        if start:
+            self.aligning = True
+            self.turn_goal = None if odom_h is None else odom_h + err
+            return 0.0, 0.0                            # the turn starts on the next step
+        return cfg.NAV_SPEED_IN_S, 0.0
 
     def _stall_check(self, odom, dt):
         """Detect 'driving forward but the wheels report no progress'."""
@@ -503,7 +769,13 @@ class Navigator:
     def _recover(self, ranges, dt):
         self.recover_time -= dt
         if self.recover_time > cfg.RECOVER_TURN_S:
-            return -cfg.RECOVER_SPEED_IN_S, 0.0
+            # back up only if something is really close ahead: backing blind
+            # into a wall behind is worse than just turning on the spot
+            ahead = min(self._reading(ranges, "front"), self._reading(ranges, "front_left"),
+                        self._reading(ranges, "front_right"))
+            if ahead < cfg.RECOVER_BACKUP_IF_AHEAD_IN:
+                return -cfg.RECOVER_SPEED_IN_S, 0.0
+            self.recover_time = cfg.RECOVER_TURN_S          # skip straight to the turn
         if self.recover_time > cfg.RECOVER_TURN_S - dt:  # pick turn direction once
             corner = self._corner_close(ranges)
             if corner:
@@ -526,10 +798,44 @@ class Navigator:
         v, w = self._step(estimate, ranges, dt, odom, odom_heading)
         if not cfg.ROBOT_CAN_ARC and v != 0.0 and w != 0.0:
             v = 0.0  # last-line guard: never send a combined drive + turn
+        wanted_v = v
+        v = self._wall_guard(v, ranges)
+        if self.guarded:
+            self.wait_reason = self.guarded
         if cfg.FIXED_SPEED_MODE:
             v, w = fixed_speed(v, w)
-        self.last_v = v
+        # When the guard holds back a drive the planner wanted, report it as a
+        # stall: the usual recovery (back up, turn toward open space) follows.
+        # Not while picking up / dropping the block, where backing up is wrong.
+        if self.phase in (BLOCK, RELEASE):
+            self.last_v = v
+        else:
+            self.last_v = wanted_v if v == 0.0 and wanted_v > 0 else v
         return v, w
+
+    def _wall_guard(self, v, ranges):
+        """Last line of defence, from the LIVE sensor readings, whatever the
+        position estimate says: never drive forward when the front sonar or a
+        front IR sees a wall close ahead, and never reverse when the back sonar
+        does. Thresholds are sensor readings (inches from the sensor face)."""
+        self.guarded = None
+        if ranges is None or v == 0.0:
+            return v
+        if v > 0:
+            front = self._reading(ranges, "front")
+            ir = min(self._reading(ranges, "front_left"), self._reading(ranges, "front_right"))
+            if front < cfg.GUARD_FRONT_IN:
+                self.guarded = f"wall guard: front {front:.1f} in"
+                return 0.0
+            if ir < cfg.GUARD_IR_IN:
+                self.guarded = f"wall guard: front IR {ir:.1f} in"
+                return 0.0
+        else:
+            back = self._reading(ranges, "back")
+            if back < cfg.GUARD_BACK_IN:
+                self.guarded = f"wall guard: back {back:.1f} in"
+                return 0.0
+        return v
 
     def _deliver(self, x, y, theta, dt):
         """Carry the block to target 2: drive to the planned drop pose, turn
@@ -579,6 +885,29 @@ class Navigator:
                 self.travel += turned / (math.pi / 2) * cfg.NAV_TURN_TRAVEL_PER_90DEG_IN
             self.last_heading = odom_heading
 
+    def _start_spin(self, odom_heading, ranges, dt):
+        """Start of the run: spin a full 360 degrees in place before driving
+        anywhere, so every sensor sweeps the walls and the localizer gets a
+        first fix. Measured with the odometry (so it only counts real turning,
+        e.g. not while the autopilot is off); without odometry, by time."""
+        target = math.radians(cfg.START_SPIN_DEG)
+        if odom_heading is not None:
+            if self.spin_last is not None:
+                self.spin_turned += abs(wrap_angle(odom_heading - self.spin_last))
+            self.spin_last = odom_heading
+            if ranges is not None and (not self.spin_samples or self.spin_samples[-1][0] != odom_heading):
+                self.spin_samples.append((odom_heading, np.array(ranges, dtype=float)))
+        else:
+            self.spin_turned += math.radians(cfg.START_SPIN_DEG_S) * dt
+        rate = math.radians(cfg.START_SPIN_DEG_S)
+        # stop early by the command delay, like every other turn
+        if self.spin_turned >= target - rate * cfg.NAV_TURN_LEAD_S:
+            self.start_spin_done = True
+            return 0.0, 0.0
+        self.wait_reason = (f"start spin: {math.degrees(self.spin_turned):.0f}/"
+                            f"{cfg.START_SPIN_DEG:g} deg")
+        return 0.0, rate                              # clockwise on screen = turning right
+
     def _waiting_for(self, spread, conf, ranges):
         """Human-readable list of what still blocks LOCALIZE -> NAVIGATE."""
         if ranges is None:
@@ -600,9 +929,16 @@ class Navigator:
 
     def _step(self, estimate, ranges, dt, odom, odom_heading):
         x, y, theta, spread, conf = estimate
+        self._dt = dt
         self._update_travel(odom, odom_heading)
         self.cooldown = max(0.0, self.cooldown - dt)
         self.wait_reason = ""
+        if not self.start_spin_done:
+            v, w = self._start_spin(odom_heading, ranges, dt)
+            if self.start_spin_done:
+                self._set_axis_after_spin(theta, spread, conf)
+            return v, w
+        self._update_axis(theta, spread, conf)
         if self.mode not in (ARRIVED, WAITING):
             self._stall_check(odom, dt)
             if self.recover_time > 0:
@@ -651,8 +987,11 @@ class Navigator:
             self.path, self.target = [], None
             if self.release_time < cfg.GRIP_TIME_S:
                 self.wait_reason = "opening gripper"
+                self.release_clear = self._body_clear(x, y, theta, cfg.BLOCK_RELEASE_CLEAR_IN)
                 return 0.0, 0.0
-            if self.release_time < cfg.GRIP_TIME_S + cfg.BLOCK_RELEASE_CLEAR_IN / 3.0:
+            if (self.release_clear
+                    and self.release_time < cfg.GRIP_TIME_S + cfg.BLOCK_RELEASE_CLEAR_IN / 3.0):
+                # pull away from the block, only if the map says there's room
                 self.wait_reason = "pulling away from the block"
                 return 3.0, 0.0
             self.phase, self.mode = DONE, ARRIVED
